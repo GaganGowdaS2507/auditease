@@ -105,6 +105,18 @@ python3 setup.py
 
 Then launch the application again.
 
+## CSV date-aware format
+
+For purchase bill imports, the app now accepts a date-aware CSV layout and automatically fills the bill date from the uploaded file when the column is present.
+
+```csv
+bill_date,item_name,hsn_code,quantity,unit,purchase_rate,gst_rate
+15-01-2026,GI Pipe 1 inch 6mtr,7306,10,piece,250.00,18
+15-01-2026,PVC Pipe 2 inch,3917,20,Mtrs,85.00,18
+```
+
+The app also continues to support dealer-style CSVs that include columns such as `Description, HSN/SAC, Quantity, Unit, Rate, GST%, Amount`, while using the date wherever available.
+
 ## Notes
 
 This project stores generated billing files under `bills/` in month-based folders. The database and settings are created locally in the project directory, so no external server is required.

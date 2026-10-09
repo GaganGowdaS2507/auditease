@@ -96,6 +96,92 @@ def create_default_settings():
 # ============================================================
 # DATABASE SCHEMA
 # ============================================================
+def ensure_database_schema(db_path: str | None = None):
+    """Add missing columns for older databases created before item_date tracking."""
+    db_file = Path(db_path) if db_path else BASE_DIR / "database" / "shop_database.db"
+    if not db_file.exists():
+        return False
+
+    conn = sqlite3.connect(str(db_file))
+    cursor = conn.cursor()
+
+    for table_name in ["purchase_items", "sales_items"]:
+        try:
+            columns = [row[1] for row in cursor.execute(f"PRAGMA table_info({table_name})").fetchall()]
+            if "item_date" not in columns:
+                cursor.execute(
+                    f"ALTER TABLE {table_name} ADD COLUMN item_date TEXT DEFAULT ''"
+                )
+                print(f"  ✅ Migrated: {table_name} adds item_date column")
+            else:
+                print(f"  ℹ️  Schema OK: {table_name} already has item_date")
+        except Exception as exc:
+            print(f"  ⚠️  Could not migrate {table_name}: {exc}")
+
+    try:
+        table_exists = cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='purchase_bills'"
+        ).fetchone()
+        if not table_exists:
+            raise RuntimeError("purchase_bills table does not exist")
+
+        from modules.purchase_module import parse_csv_bill, round2
+
+        bills_missing_items = cursor.execute("""
+            SELECT id, bill_date, file_path
+            FROM purchase_bills
+            WHERE id NOT IN (
+                SELECT DISTINCT purchase_bill_id
+                FROM purchase_items
+            )
+        """).fetchall()
+
+        for bill_id, bill_date, file_path in bills_missing_items:
+            if not file_path or not Path(file_path).exists():
+                continue
+
+            items = parse_csv_bill(str(file_path))
+            if not items:
+                continue
+
+            for item in items:
+                item_date = item.get("item_date") or bill_date
+                quantity = float(item.get("quantity", 0) or 0)
+                rate = float(item.get("rate", 0) or 0)
+                gst_rate = float(item.get("gst_rate", 0) or 0)
+                gst_amount = round2(quantity * rate * gst_rate / 100)
+                total_amount = round2((quantity * rate) + gst_amount)
+
+                cursor.execute("""
+                    INSERT INTO purchase_items (
+                        purchase_bill_id, item_name, item_date, hsn_code,
+                        quantity, unit, purchase_rate, gst_rate,
+                        gst_amount, total_amount, remaining_qty
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    bill_id,
+                    item.get("item_name", "").strip(),
+                    item_date,
+                    item.get("hsn_code", "-"),
+                    quantity,
+                    item.get("unit", "piece"),
+                    rate,
+                    gst_rate,
+                    gst_amount,
+                    total_amount,
+                    quantity,
+                ))
+
+        conn.commit()
+        print("  ✅ Repaired missing purchase item rows from uploaded CSV files")
+    except Exception as exc:
+        if "purchase_bills table does not exist" not in str(exc):
+            print(f"  ⚠️  Could not repair purchase item rows: {exc}")
+
+    conn.close()
+    return True
+
+
 def create_database():
     """Create SQLite database with all tables"""
     db_path = BASE_DIR / "database" / "shop_database.db"
@@ -174,6 +260,7 @@ def create_database():
             purchase_bill_id INTEGER NOT NULL,
             item_master_id  INTEGER,                -- links to items_master
             item_name       TEXT NOT NULL,
+            item_date       TEXT DEFAULT '',        -- YYYY-MM-DD for this item
             hsn_code        TEXT DEFAULT '-',
             quantity        REAL NOT NULL,
             unit            TEXT DEFAULT 'piece',
@@ -187,6 +274,11 @@ def create_database():
         )
     """)
     print("  ✅ Table: purchase_items")
+
+    try:
+        cursor.execute("ALTER TABLE purchase_items ADD COLUMN item_date TEXT DEFAULT ''")
+    except Exception:
+        pass
 
     # --------------------------------------------------------
     # TABLE 5: sales_bills
@@ -227,6 +319,7 @@ def create_database():
             sales_bill_id   INTEGER NOT NULL,
             purchase_item_id INTEGER,               -- links back to purchase
             item_name       TEXT NOT NULL,
+            item_date       TEXT DEFAULT '',        -- YYYY-MM-DD for this item
             hsn_code        TEXT DEFAULT '-',
             quantity        REAL NOT NULL,
             unit            TEXT DEFAULT 'piece',
@@ -243,6 +336,11 @@ def create_database():
         )
     """)
     print("  ✅ Table: sales_items")
+
+    try:
+        cursor.execute("ALTER TABLE sales_items ADD COLUMN item_date TEXT DEFAULT ''")
+    except Exception:
+        pass
 
     # --------------------------------------------------------
     # TABLE 7: bill_number_tracker

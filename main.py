@@ -22,11 +22,17 @@ DB_PATH = BASE_DIR / "database" / "shop_database.db"
 # CHECK SETUP IS DONE BEFORE STARTING
 # ============================================================
 def check_setup():
-    """Check if setup.py was run, if not run it automatically"""
+    """Check if setup.py was run, if not run it automatically."""
     if not CONFIG_PATH.exists() or not DB_PATH.exists():
         print("[MAIN] First run detected — running setup...")
         import setup
         setup.run_setup()
+
+    try:
+        import setup
+        setup.ensure_database_schema(str(DB_PATH))
+    except Exception as exc:
+        print(f"[MAIN] Schema check failed: {exc}")
 
 
 # ============================================================

@@ -128,6 +128,78 @@ def safe_float(value, default=0.0) -> float:
         return default
 
 
+def normalize_csv_bill_date(value) -> str | None:
+    """Normalize common date strings to YYYY-MM-DD."""
+    if value is None:
+        return None
+
+    cleaned = str(value).strip().strip('"').strip("'")
+    if not cleaned:
+        return None
+
+    cleaned = cleaned.split(" ")[0].split("T")[0]
+    formats = [
+        "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y",
+        "%m/%d/%Y", "%Y/%m/%d", "%d-%m-%y",
+        "%d/%m/%y", "%m-%d-%Y", "%m-%d-%y",
+    ]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(cleaned, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    return None
+
+
+def extract_bill_date_from_csv(file_path: str) -> str | None:
+    """Read an optional bill_date column from the uploaded CSV."""
+    try:
+        with open(file_path, "r", encoding="utf-8-sig") as fh:
+            content = fh.read()
+    except Exception:
+        return None
+
+    if not content.strip():
+        return None
+
+    delimiter = ","
+    if ";" in content and "," not in content:
+        delimiter = ";"
+
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+
+        cols = [
+            c.strip().strip('"').lower()
+            for c in line.split(delimiter)
+        ]
+
+        for idx, col in enumerate(cols):
+            if any(k in col for k in [
+                "bill date", "date", "invoice date",
+                "purchase date", "sale date"
+            ]):
+                for row in lines[i + 1:]:
+                    if not row.strip():
+                        continue
+                    row_cols = [
+                        c.strip().strip('"')
+                        for c in row.split(delimiter)
+                    ]
+                    if idx >= len(row_cols):
+                        continue
+                    normalized = normalize_csv_bill_date(row_cols[idx])
+                    if normalized:
+                        return normalized
+                return None
+
+    return None
+
+
 class DBHelper:
     def __init__(self):
         self.db_path = DB_PATH
@@ -373,24 +445,28 @@ def parse_csv_bill(file_path: str) -> list:
             if raw_unit:
                 unit = raw_unit
 
-        # ── CHANGED: Skip reading "Rate" column entirely ──
-        # Get amount (the final printed total after all discounts)
-        amount = 0.0
-        if "amount" in col_map:
-            amount = safe_float(cols[col_map["amount"]], 0)
-
         # Get GST rate from bill (stored for reference)
         gst_rate = 18.0
         if "gst_rate" in col_map:
             gst_rate = safe_float(cols[col_map["gst_rate"]], 18)
 
-        # ── COMPOSITION SCHEME: rate = amount / quantity ──
-        # Shop is on COMPOSITION SCHEME — no GST is collected on sales.
-        # The purchase "amount" is the final total after all discounts.
-        # Simply divide by quantity to get effective per-unit purchase rate.
-        # Formula: rate = amount / quantity  (NO GST stripping)
+        # Get rate from either the direct purchase-rate template or
+        # the dealer bill's total amount column.
         rate = 0.0
-        if amount > 0 and quantity > 0:
+        if "rate" in col_map:
+            rate = safe_float(cols[col_map["rate"]], 0)
+
+        # Get amount (the final printed total after all discounts)
+        amount = 0.0
+        if "amount" in col_map:
+            amount = safe_float(cols[col_map["amount"]], 0)
+        elif rate > 0 and quantity > 0:
+            amount = round2(quantity * rate)
+
+        # If the file includes direct purchase_rate values, use them
+        # directly. For dealer bills, derive a per-unit rate from the
+        # net amount after discounts.
+        if rate <= 0 and amount > 0 and quantity > 0:
             rate = round2(amount / quantity)
 
         if rate <= 0:
@@ -406,6 +482,8 @@ def parse_csv_bill(file_path: str) -> list:
             "discount_pct": 0.0,            # discount already baked into amount
             "amount":       amount,
         })
+
+    return items
 
 # ============================================================
 # ITEM ROW — Single editable row
@@ -431,6 +509,7 @@ class ItemRow:
 
         # Variables
         self.var_name     = tk.StringVar()
+        self.var_item_date = tk.StringVar(value=date.today().strftime("%d-%m-%Y"))
         self.var_hsn      = tk.StringVar(value="-")
         self.var_qty      = tk.StringVar(value="1")
         self.var_unit     = tk.StringVar(value="piece")
@@ -467,13 +546,27 @@ class ItemRow:
             self.frame,
             textvariable=self.var_name,
             font=FONTS["table"],
-            width=25,
+            width=20,
             relief="solid",
             bd=1,
             bg="white"
         )
         self.name_entry.grid(
             row=0, column=1, padx=3, pady=3
+        )
+
+        # ---- Item Date ----
+        self.date_entry = tk.Entry(
+            self.frame,
+            textvariable=self.var_item_date,
+            font=FONTS["table"],
+            width=10,
+            relief="solid",
+            bd=1,
+            bg="#f5f5ff"
+        )
+        self.date_entry.grid(
+            row=0, column=2, padx=3, pady=3
         )
 
         # ---- HSN Code (editable) ----
@@ -487,7 +580,7 @@ class ItemRow:
             bg="white"
         )
         self.hsn_entry.grid(
-            row=0, column=2, padx=3, pady=3
+            row=0, column=3, padx=3, pady=3
         )
 
         # ---- Quantity ----
@@ -495,13 +588,13 @@ class ItemRow:
             self.frame,
             textvariable=self.var_qty,
             font=FONTS["table"],
-            width=8,
+            width=7,
             relief="solid",
             bd=1,
             bg="white"
         )
         self.qty_entry.grid(
-            row=0, column=3, padx=3, pady=3
+            row=0, column=4, padx=3, pady=3
         )
 
         # ---- Unit — EDITABLE Combobox ----
@@ -515,7 +608,7 @@ class ItemRow:
             # NOT readonly — allows typing
         )
         self.unit_cb.grid(
-            row=0, column=4, padx=3, pady=3
+            row=0, column=5, padx=3, pady=3
         )
 
         # ---- Rate (purchase rate) ----
@@ -529,7 +622,7 @@ class ItemRow:
             bg="white"
         )
         self.rate_entry.grid(
-            row=0, column=5, padx=3, pady=3
+            row=0, column=6, padx=3, pady=3
         )
 
         # ---- GST Rate — EDITABLE Entry ----
@@ -545,7 +638,7 @@ class ItemRow:
             bg="#fff9c4"  # light yellow to stand out
         )
         self.gst_entry.grid(
-            row=0, column=6, padx=3, pady=3
+            row=0, column=7, padx=3, pady=3
         )
 
         # Small "%" label next to GST
@@ -555,7 +648,7 @@ class ItemRow:
             font=FONTS["small"],
             bg=bg,
             fg=COLORS["text_muted"]
-        ).grid(row=0, column=7, padx=(0, 3))
+        ).grid(row=0, column=8, padx=(0, 3))
 
         # ---- GST Amount (read-only, calculated) ----
         tk.Entry(
@@ -567,7 +660,7 @@ class ItemRow:
             bd=1,
             bg="#f0f0f0",
             state="readonly"
-        ).grid(row=0, column=8, padx=3, pady=3)
+        ).grid(row=0, column=9, padx=3, pady=3)
 
         # ---- Total (read-only, calculated) ----
         tk.Entry(
@@ -580,7 +673,7 @@ class ItemRow:
             bg="#e8f5e9",
             fg=COLORS["success"],
             state="readonly"
-        ).grid(row=0, column=9, padx=3, pady=3)
+        ).grid(row=0, column=10, padx=3, pady=3)
 
         # ---- Delete button ----
         tk.Button(
@@ -594,7 +687,7 @@ class ItemRow:
             pady=2,
             cursor="hand2",
             command=lambda: self.on_delete(self)
-        ).grid(row=0, column=10, padx=5, pady=3)
+        ).grid(row=0, column=11, padx=5, pady=3)
 
     def _bind_calculations(self):
         """Bind auto-calculation on field changes"""
@@ -673,6 +766,7 @@ class ItemRow:
         """Return current row data as dict"""
         return {
             "item_name":  self.var_name.get().strip(),
+            "item_date":  self.var_item_date.get().strip(),
             "hsn_code":   self.var_hsn.get().strip()
                           or "-",
             "quantity":   safe_float(self.var_qty.get()),
@@ -695,6 +789,11 @@ class ItemRow:
         self.var_name.set(
             data.get("item_name", "")
         )
+        item_date = data.get("item_date")
+        if item_date:
+            self.var_item_date.set(str(item_date))
+        else:
+            self.var_item_date.set(date.today().strftime("%d-%m-%Y"))
         self.var_hsn.set(
             data.get("hsn_code", "-")
         )
@@ -754,9 +853,10 @@ def build_items_table_header(parent):
 
     columns = [
         ("#",          3),
-        ("Item Name", 25),
+        ("Item Name", 20),
+        ("Date",       10),
         ("HSN Code",  10),
-        ("Qty",        8),
+        ("Qty",        7),
         ("Unit",       7),
         ("Rate (₹)",  10),
         ("GST%",       6),
@@ -816,8 +916,8 @@ class PurchaseBillDialog(tk.Toplevel):
             else "Add Purchase Bill"
         )
         self.title(title)
-        self.geometry("1150x800")
-        self.minsize(1000, 700)
+        self.geometry("1250x840")
+        self.minsize(1100, 760)
         self.resizable(True, True)
         self.configure(bg=COLORS["bg_main"])
         self.grab_set()
@@ -917,7 +1017,7 @@ class PurchaseBillDialog(tk.Toplevel):
         )
         card.pack(fill="x", padx=10, pady=(8, 4))
 
-        # Row 1 — Dealer | Bill No | Date
+        # Row 1 — Dealer | Bill Number
         row1 = tk.Frame(card, bg=COLORS["bg_card"])
         row1.pack(fill="x", pady=4)
 
@@ -935,7 +1035,7 @@ class PurchaseBillDialog(tk.Toplevel):
             row1,
             textvariable=self.var_dealer,
             font=FONTS["body"],
-            width=22,
+            width=28,
             relief="solid",
             bd=1,
             bg="#fafafa"
@@ -955,15 +1055,18 @@ class PurchaseBillDialog(tk.Toplevel):
             row1,
             textvariable=self.var_bill_no,
             font=FONTS["body"],
-            width=15,
+            width=18,
             relief="solid",
             bd=1,
             bg="#fafafa"
-        ).pack(side="left", padx=(0, 20))
+        ).pack(side="left", padx=(0, 5))
 
-        # Date
+        # Row 2 — Bill date
+        row2 = tk.Frame(card, bg=COLORS["bg_card"])
+        row2.pack(fill="x", pady=4)
+
         tk.Label(
-            row1,
+            row2,
             text="Bill Date *",
             font=FONTS["label_bold"],
             bg=COLORS["bg_card"],
@@ -974,26 +1077,26 @@ class PurchaseBillDialog(tk.Toplevel):
             value=date.today().strftime("%d-%m-%Y")
         )
         tk.Entry(
-            row1,
+            row2,
             textvariable=self.var_bill_date,
             font=FONTS["body"],
-            width=13,
+            width=15,
             relief="solid",
             bd=1,
             bg="#fafafa"
-        ).pack(side="left", padx=(0, 5))
+        ).pack(side="left", padx=(0, 8))
 
         tk.Label(
-            row1,
+            row2,
             text="(DD-MM-YYYY)",
             font=FONTS["small"],
             bg=COLORS["bg_card"],
             fg=COLORS["text_muted"]
-        ).pack(side="left")
+        ).pack(side="left", padx=(0, 20))
 
-        # Row 2 — Bill type | Notes
-        row2 = tk.Frame(card, bg=COLORS["bg_card"])
-        row2.pack(fill="x", pady=4)
+        # Row 3 — Bill type | Notes
+        row3 = tk.Frame(card, bg=COLORS["bg_card"])
+        row3.pack(fill="x", pady=4)
 
         tk.Label(
             row2,
@@ -1014,7 +1117,7 @@ class PurchaseBillDialog(tk.Toplevel):
             ("composition", "Composition Scheme"),
         ]:
             tk.Radiobutton(
-                row2,
+                row3,
                 text=lbl,
                 variable=self.var_bill_type,
                 value=val,
@@ -1024,7 +1127,7 @@ class PurchaseBillDialog(tk.Toplevel):
             ).pack(side="left", padx=(0, 15))
 
         tk.Label(
-            row2,
+            row3,
             text="Notes:",
             font=FONTS["label_bold"],
             bg=COLORS["bg_card"],
@@ -1033,7 +1136,7 @@ class PurchaseBillDialog(tk.Toplevel):
 
         self.var_notes = tk.StringVar()
         tk.Entry(
-            row2,
+            row3,
             textvariable=self.var_notes,
             font=FONTS["body"],
             width=40,
@@ -1160,6 +1263,17 @@ class PurchaseBillDialog(tk.Toplevel):
         try:
             self.uploaded_file_path = path
 
+            imported_date = extract_bill_date_from_csv(path)
+            if imported_date:
+                try:
+                    self.var_bill_date.set(
+                        datetime.strptime(
+                            imported_date, "%Y-%m-%d"
+                        ).strftime("%d-%m-%Y")
+                    )
+                except ValueError:
+                    self.var_bill_date.set(imported_date)
+
             # Use smart CSV parser
             items = parse_csv_bill(path)
 
@@ -1187,29 +1301,16 @@ class PurchaseBillDialog(tk.Toplevel):
             )
             self._recalculate_totals()
 
-            # # Show what was imported
-            # discount_note = ""
-            # items_with_disc = [
-            #     i for i in items
-            #     if i.get("discount_pct", 0) > 0
-            # ]
-            # if items_with_disc:
-            #     discount_note = (
-            #         f"\n\n⚠️  Discount applied on "
-            #         f"{len(items_with_disc)} items.\n"
-            #         f"Rate shown is after discount."
-            #     )
-
             messagebox.showinfo(
                 "✅ CSV Imported Successfully",
                 f"Imported {len(items)} items.\n\n"
                 f"Please review:\n"
                 f"• Item names\n"
+                f"• Dates\n"
                 f"• HSN codes\n"
-                f"• GST rates (your bill uses 6%)\n"
-                f"• Quantities and rates"
-                + discount_note +
-                "\n\nClick '💾 Save Bill' when done."
+                f"• GST rates\n"
+                f"• Quantities and rates\n\n"
+                f"Click '💾 Save Bill' when done."
             )
 
         except Exception as e:
@@ -1218,12 +1319,12 @@ class PurchaseBillDialog(tk.Toplevel):
                 f"Could not read CSV.\n\n"
                 f"Error: {e}\n\n"
                 f"Supported formats:\n"
-                f"• Your dealer bill format\n"
+                f"• Recommended format\n"
+                f"  (bill_date, item_name, hsn_code, "
+                f"quantity, unit, purchase_rate, gst_rate)\n"
+                f"• Dealer bill format\n"
                 f"  (Description, HSN/SAC, Qty, "
-                f"Unit, Rate, Discount%, GST%, Amount)\n"
-                f"• Our template format\n"
-                f"  (item_name, hsn_code, quantity, "
-                f"unit, purchase_rate, gst_rate)"
+                f"Unit, Rate, Discount%, GST%, Amount)"
             )
 
     def _extract_ocr(self):
@@ -1314,31 +1415,32 @@ class PurchaseBillDialog(tk.Toplevel):
             ) as f:
                 writer = csv.writer(f)
                 writer.writerow([
-                    "item_name", "hsn_code",
+                    "bill_date", "item_name", "hsn_code",
                     "quantity", "unit",
                     "purchase_rate", "gst_rate"
                 ])
                 samples = [
-                    ["GI Pipe 1 inch 6mtr",
+                    ["15-01-2026", "GI Pipe 1 inch 6mtr",
                      "7306", "10", "piece",
                      "250.00", "18"],
-                    ["PVC Pipe 2 inch",
+                    ["15-01-2026", "PVC Pipe 2 inch",
                      "3917", "20", "Mtrs",
                      "85.00", "18"],
-                    ["Ball Valve 1 inch",
+                    ["15-01-2026", "Ball Valve 1 inch",
                      "8481", "15", "Nos",
                      "120.00", "18"],
-                    ["CPVC Pipe 1 inch",
+                    ["15-01-2026", "CPVC Pipe 1 inch",
                      "39172390", "250", "Mtrs",
                      "200.00", "6"],
-                    ["CPVC Elbow 90°",
+                    ["15-01-2026", "CPVC Elbow 90°",
                      "39172390", "100", "Nos",
                      "37.55", "6"],
                 ]
                 writer.writerows(samples)
                 for _ in range(20):
                     writer.writerow(
-                        ["", "-", "", "piece", "", "18"]
+                        ["15-01-2026", "", "-", "",
+                         "piece", "", "18"]
                     )
 
             messagebox.showinfo(
@@ -1470,6 +1572,12 @@ class PurchaseBillDialog(tk.Toplevel):
             on_delete_callback=self._delete_item_row,
             hsn_data=self.hsn_data
         )
+        try:
+            bill_date = self.var_bill_date.get().strip()
+            if bill_date:
+                row.var_item_date.set(bill_date)
+        except Exception:
+            pass
         row.pack(fill="x")
         self.item_rows.append(row)
         self._recalculate_totals()
@@ -1785,18 +1893,26 @@ class PurchaseBillDialog(tk.Toplevel):
                 )
                 total = round2(taxable + gst_amt)
 
+                item_date = item.get("item_date") or self.var_bill_date.get().strip()
+                if item_date:
+                    try:
+                        item_date = datetime.strptime(item_date, "%d-%m-%Y").strftime("%Y-%m-%d")
+                    except Exception:
+                        pass
+
                 db.execute("""
                     INSERT INTO purchase_items
                     (purchase_bill_id, item_master_id,
-                     item_name, hsn_code,
+                     item_name, item_date, hsn_code,
                      quantity, unit,
                      purchase_rate, gst_rate,
                      gst_amount, total_amount,
                      remaining_qty)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     bill_id, master_id,
                     item["item_name"],
+                    item_date,
                     item["hsn_code"],
                     item["quantity"],
                     item["unit"],
@@ -1943,6 +2059,7 @@ class PurchaseBillDialog(tk.Toplevel):
             row = self._add_item_row()
             row.set_data({
                 "item_name": item["item_name"],
+                "item_date": item.get("item_date") or bill["bill_date"],
                 "hsn_code":  item["hsn_code"],
                 "quantity":  item["quantity"],
                 "unit":      item["unit"],

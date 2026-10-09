@@ -1,0 +1,31 @@
+bill_date,item_name,hsn_code,quantity,unit,purchase_rate,gst_rate
+15-01-2026,GI Pipe 1 inch 6mtr,7306,250,piece,250.0,18
+15-01-2026,PVC Pipe 2 inch,3917,500,Mtrs,85.0,18
+15-01-2026,Ball Valve 1 inch,8481,375,Nos,120.0,18
+15-01-2026,CPVC Pipe 1 inch,39172390,625,Mtrs,200.0,6
+15-01-2026,GI Pipe 2 inch 6mtr,7306,200,piece,520.0,18
+15-01-2026,PVC Elbow 2 inch,3917,750,Nos,35.0,18
+15-01-2026,PVC Tee 2 inch,3917,625,Nos,42.0,18
+15-01-2026,CPVC Elbow 1 inch,39172390,500,Nos,28.0,6
+15-01-2026,CPVC Tee 1 inch,39172390,450,Nos,36.0,6
+15-01-2026,Brass Gate Valve 1 inch,8481,150,Nos,450.0,18
+15-01-2026,UPVC Pipe 3 inch,3917,450,Mtrs,165.0,18
+15-01-2026,GI Nipple 1 inch,7307,625,Nos,48.0,18
+15-01-2026,MS Pipe Clamp 2 inch,7326,1000,Nos,22.0,18
+15-01-2026,Flexible Hose 1 inch,8307,250,Nos,180.0,18
+15-01-2026,Water Pump 1 HP,8413,30,Nos,6500.0,18
+15-01-2026,PVC Solvent Cement 500ml,3506,250,bottle,145.0,18
+15-01-2026,PTFE Thread Seal Tape,3920,1250,Nos,12.0,18
+15-01-2026,SS Hose Clamp,7326,750,Nos,28.0,18
+15-01-2026,Float Valve 1 inch,8481,200,Nos,210.0,18
+15-01-2026,CPVC Pipe 3/4 inch,39172390,750,Mtrs,125.0,6
+15-01-2026,PVC Pipe 4 inch,3917,375,Mtrs,280.0,18
+15-01-2026,GI Elbow 1 inch,7307,300,Nos,95.0,18
+15-01-2026,GI Tee 1 inch,7307,250,Nos,125.0,18
+15-01-2026,Butterfly Valve 3 inch,8481,50,Nos,1850.0,18
+15-01-2026,Pressure Gauge,9026,75,Nos,650.0,18
+15-01-2026,Submersible Cable 3 Core,8544,625,Mtrs,115.0,18
+15-01-2026,PVC Water Tank Connector,3917,250,Nos,85.0,18
+15-01-2026,Brass Bib Cock,8481,188,Nos,320.0,18
+15-01-2026,HDPE Pipe 2 inch,3917,500,Mtrs,190.0,18
+15-01-2026,Non Return Valve 2 inch,8481,88,Nos,950.0,18

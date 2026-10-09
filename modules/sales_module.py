@@ -25,6 +25,7 @@ import json
 import csv
 import random
 import math
+import calendar
 from pathlib import Path
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
@@ -379,18 +380,46 @@ class BillSplitter:
         self,
         n_bills: int,
         month: int,
-        year: int
+        year: int,
+        start_date: date = None,
+        end_date: date = None
     ) -> list:
         """
         Distribute N bill dates across the month naturally.
 
-        Strategy:
-        - More bills mid-month and weekends
-          (busy periods for hardware shops)
-        - At least 1 day gap between consecutive dates
-          for same volume
-        - Random spread overall
+        If start_date and end_date are provided, choose random dates
+        only from that inclusive range. Otherwise fall back to the
+        natural working-day distribution for the selected month.
         """
+        if start_date and end_date:
+            normalized_start = min(start_date, end_date)
+            normalized_end = max(start_date, end_date)
+            start_date = normalized_start
+            end_date = normalized_end
+
+            candidate_dates = []
+            current = start_date
+            while current <= end_date:
+                if current.year == year and current.month == month:
+                    candidate_dates.append(current)
+                current += timedelta(days=1)
+
+            if not candidate_dates:
+                raise ValueError(
+                    "Selected date range does not contain any valid "
+                    f"dates for {MONTH_NAMES[month]} {year}."
+                )
+
+            if n_bills <= len(candidate_dates):
+                chosen = sorted(
+                    random.sample(candidate_dates, n_bills)
+                )
+            else:
+                chosen = sorted(
+                    random.choices(candidate_dates, k=n_bills)
+                )
+            return chosen
+
         working_days = self._get_working_days(month, year)
 
         if not working_days:
@@ -422,6 +451,8 @@ class BillSplitter:
         override_margin_min:  float = None,
         override_margin_max:  float = None,
         override_margin_global: float = None,
+        start_date: date = None,
+        end_date: date = None,
     ) -> list:
         """
         Main splitting function.
@@ -497,7 +528,11 @@ class BillSplitter:
 
         # Step 3: Generate bill dates
         bill_dates = self._distribute_dates(
-            n_bills, month, year
+            n_bills,
+            month,
+            year,
+            start_date=start_date,
+            end_date=end_date,
         )
 
         # Step 4: Get customer names
@@ -1676,6 +1711,8 @@ class SalesFrame(tk.Frame):
         today = date.today()
         self.filter_month = tk.IntVar(value=today.month)
         self.filter_year  = tk.IntVar(value=today.year)
+        self.var_start_date = tk.StringVar()
+        self.var_end_date = tk.StringVar()
 
         # Split configuration vars
         self.var_n_bills      = tk.IntVar(value=10)
@@ -1864,7 +1901,21 @@ class SalesFrame(tk.Frame):
             )
         if year_str:
             self.filter_year.set(int(year_str))
+        self._refresh_date_range_defaults()
         self._load_data()
+
+    def _refresh_date_range_defaults(self):
+        """Reset the generated-sales date range to the selected month."""
+        month = self.filter_month.get()
+        year = self.filter_year.get()
+        first_day = date(year, month, 1)
+        last_day = date(year, month, calendar.monthrange(year, month)[1])
+        if not self.var_start_date.get():
+            self.var_start_date.set(first_day.strftime("%d-%m-%Y"))
+        if not self.var_end_date.get():
+            self.var_end_date.set(last_day.strftime("%d-%m-%Y"))
+        self.var_start_date.set(first_day.strftime("%d-%m-%Y"))
+        self.var_end_date.set(last_day.strftime("%d-%m-%Y"))
 
     # ----------------------------------------------------------
     # GENERATE PANEL
@@ -2004,6 +2055,66 @@ class SalesFrame(tk.Frame):
                 activebackground=COLORS["bg_card"]
             ).pack(side="left", padx=(0, 10))
 
+        # Date range for generated sales bills
+        date_range_frame = tk.Frame(
+            config_card,
+            bg="#eef8ff",
+            padx=10, pady=8
+        )
+        date_range_frame.pack(fill="x", pady=(0, 8))
+
+        tk.Label(
+            date_range_frame,
+            text="📅 Sales Date Range",
+            font=FONTS["label_bold"],
+            bg="#eef8ff",
+            fg=COLORS["primary"]
+        ).pack(anchor="w", pady=(0, 6))
+
+        month = self.filter_month.get()
+        year = self.filter_year.get()
+        self.var_start_date.set(
+            date(year, month, 1).strftime("%d-%m-%Y")
+        )
+        self.var_end_date.set(
+            date(year, month, calendar.monthrange(year, month)[1]).strftime("%d-%m-%Y")
+        )
+
+        date_row = tk.Frame(date_range_frame, bg="#eef8ff")
+        date_row.pack(fill="x", pady=2)
+
+        tk.Label(
+            date_row,
+            text="From:",
+            font=FONTS["small"],
+            bg="#eef8ff",
+            fg=COLORS["text_dark"]
+        ).pack(side="left")
+
+        tk.Entry(
+            date_row,
+            textvariable=self.var_start_date,
+            font=FONTS["body"],
+            width=12,
+            relief="solid", bd=1
+        ).pack(side="left", padx=(5, 12))
+
+        tk.Label(
+            date_row,
+            text="To:",
+            font=FONTS["small"],
+            bg="#eef8ff",
+            fg=COLORS["text_dark"]
+        ).pack(side="left")
+
+        tk.Entry(
+            date_row,
+            textvariable=self.var_end_date,
+            font=FONTS["body"],
+            width=12,
+            relief="solid", bd=1
+        ).pack(side="left", padx=(5, 0))
+
         # Margin settings
         margin_frame = tk.Frame(
             config_card,
@@ -2100,7 +2211,7 @@ class SalesFrame(tk.Frame):
         self._on_margin_type_change()
 
         # ---- Generate Button ----
-        tk.Button(
+        self.generate_button = tk.Button(
             parent,
             text="⚡ Generate Sales Bills",
             font=FONTS["button"],
@@ -2110,7 +2221,9 @@ class SalesFrame(tk.Frame):
             padx=20, pady=12,
             cursor="hand2",
             command=self._generate_bills
-        ).pack(fill="x", pady=5)
+        )
+        self.generate_button.pack(fill="x", pady=5)
+        self._set_generate_enabled(True)
 
         # Tally check button
         tk.Button(
@@ -2137,6 +2250,18 @@ class SalesFrame(tk.Frame):
             cursor="hand2",
             command=self._export_csv
         ).pack(fill="x", pady=3)
+
+    def _parse_date_input(self, value: str, label: str) -> date:
+        """Parse DD-MM-YYYY strings from the UI."""
+        value = (value or "").strip()
+        if not value:
+            raise ValueError(f"{label} is required.")
+        try:
+            return datetime.strptime(value, "%d-%m-%Y").date()
+        except ValueError:
+            raise ValueError(
+                f"{label} must be a valid date in DD-MM-YYYY format."
+            )
 
     def _on_margin_type_change(self):
         """Show/hide margin input fields"""
@@ -2267,6 +2392,15 @@ class SalesFrame(tk.Frame):
         self._load_pool_summary(month, year)
         self._load_existing_bills(month, year)
 
+    def _set_generate_enabled(self, enabled: bool):
+        """Keep the action visible and usable even if the selected month is empty."""
+        if hasattr(self, "generate_button"):
+            self.generate_button.configure(
+                state="normal",
+                bg=COLORS["accent"],
+                fg="white"
+            )
+
     def _load_pool_summary(self, month: int, year: int):
         """Show purchase pool summary"""
         for w in self.pool_info_frame.winfo_children():
@@ -2300,7 +2434,10 @@ class SalesFrame(tk.Frame):
                 bg=COLORS["bg_card"],
                 fg=COLORS["warning"]
             ).pack(pady=10)
+            self._set_generate_enabled(True)
             return
+
+        self._set_generate_enabled(True)
 
         month_name = MONTH_NAMES[month]
         remaining  = totals.get("remaining_qty", 0)
@@ -2527,6 +2664,24 @@ class SalesFrame(tk.Frame):
             )
             return
 
+        try:
+            start_date = self._parse_date_input(
+                self.var_start_date.get(), "Start date"
+            )
+            end_date = self._parse_date_input(
+                self.var_end_date.get(), "End date"
+            )
+            if start_date > end_date:
+                raise ValueError("Start date cannot be after end date.")
+            if start_date.month != month or end_date.month != month or \
+               start_date.year != year or end_date.year != year:
+                raise ValueError(
+                    "Date limits must fall within the selected month and year."
+                )
+        except ValueError as exc:
+            messagebox.showerror("Date Error", str(exc))
+            return
+
         margin_min = self.var_margin_min.get()
         margin_max = self.var_margin_max.get()
         if margin_min >= margin_max and \
@@ -2578,6 +2733,8 @@ class SalesFrame(tk.Frame):
                 override_margin_max=margin_max,
                 override_margin_global=
                     self.var_margin_global.get(),
+                start_date=start_date,
+                end_date=end_date,
             )
 
             if not bills:
@@ -2701,18 +2858,19 @@ class SalesFrame(tk.Frame):
                         INSERT INTO sales_items
                         (sales_bill_id,
                          purchase_item_id,
-                         item_name, hsn_code,
-                         quantity, unit,
+                         item_name, item_date,
+                         hsn_code, quantity, unit,
                          selling_rate, gst_rate,
                          cgst_rate, sgst_rate,
                          cgst_amount, sgst_amount,
                          total_amount, margin_percent)
                         VALUES
-                        (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, (
                         sales_bill_id,
                         item["purchase_item_id"],
                         item["item_name"],
+                        bill_date_str,
                         item["hsn_code"],
                         item["quantity"],
                         item["unit"],
