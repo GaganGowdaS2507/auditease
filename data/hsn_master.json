@@ -1,0 +1,144 @@
+{
+    "pipes_and_fittings": [
+        {
+            "hsn": "7304",
+            "description": "Seamless iron/steel pipes",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "7306",
+            "description": "Welded iron/steel pipes (GI Pipe)",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "7307",
+            "description": "Pipe fittings (elbows, bends, couplings)",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "3917",
+            "description": "PVC Pipes and fittings",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "3917",
+            "description": "CPVC Pipes",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "8481",
+            "description": "Valves, taps, cocks (ball valve, gate valve)",
+            "gst_rate": 18
+        }
+    ],
+    "cement_and_building": [
+        {
+            "hsn": "2523",
+            "description": "Portland cement, white cement",
+            "gst_rate": 28
+        },
+        {
+            "hsn": "7214",
+            "description": "MS Rods, iron bars",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "7210",
+            "description": "Steel sheets",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "7317",
+            "description": "Nails, tacks, staples (iron/steel)",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "7318",
+            "description": "Screws, bolts, nuts, washers",
+            "gst_rate": 18
+        }
+    ],
+    "paint_and_chemicals": [
+        {
+            "hsn": "3208",
+            "description": "Paints (synthetic, oil-based)",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "3209",
+            "description": "Water-based paints",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "3210",
+            "description": "Varnishes, distempers",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "3214",
+            "description": "Putty, sealants",
+            "gst_rate": 18
+        }
+    ],
+    "electrical": [
+        {
+            "hsn": "8536",
+            "description": "Switches, sockets, plugs",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "8544",
+            "description": "Electric wires, cables",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "9405",
+            "description": "Bulbs, tube lights, LED",
+            "gst_rate": 12
+        }
+    ],
+    "tools_and_hardware": [
+        {
+            "hsn": "8205",
+            "description": "Hand tools (hammers, spanners, pliers)",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "8204",
+            "description": "Wrenches and spanners",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "8301",
+            "description": "Locks, padlocks",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "8302",
+            "description": "Hinges, handles, brackets",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "8481",
+            "description": "Taps, faucets, shower heads",
+            "gst_rate": 18
+        }
+    ],
+    "sanitary": [
+        {
+            "hsn": "6910",
+            "description": "Ceramic wash basins, sinks",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "3922",
+            "description": "Plastic baths, showers, sinks",
+            "gst_rate": 18
+        },
+        {
+            "hsn": "7324",
+            "description": "Stainless steel sinks",
+            "gst_rate": 18
+        }
+    ]
+}

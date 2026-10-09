@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Bill of Supply - {{ bill_number }}</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Arial', sans-serif;
+            font-size: 12px;
+            color: #212121;
+            background: #ffffff;
+        }
+
+        @page {
+            size: A4;
+            margin: 10mm 12mm 12mm 12mm;
+        }
+
+        @media print {
+            body {
+                print-color-adjust: exact;
+                -webkit-print-color-adjust: exact;
+            }
+            .no-print { display: none !important; }
+        }
+
+        .invoice-wrapper {
+            width: 100%;
+            max-width: 794px;
+            margin: 0 auto;
+            border: 2px solid #e65100;
+        }
+
+        /* Shop Header — Orange theme for Composition */
+        .shop-header {
+            background: linear-gradient(
+                135deg, #e65100 0%, #ff8f00 100%
+            );
+            color: white;
+            text-align: center;
+            padding: 14px 20px 10px;
+            border-bottom: 3px solid #1a237e;
+        }
+
+        .shop-name {
+            font-size: 22px;
+            font-weight: 700;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            margin-bottom: 3px;
+        }
+
+        .shop-address {
+            font-size: 10px;
+            color: #ffe0b2;
+            margin-bottom: 2px;
+        }
+
+        .shop-gstin {
+            font-size: 11px;
+            font-weight: 700;
+            color: #fff9c4;
+        }
+
+        /* Composition Alert Banner */
+        .composition-alert {
+            background: #fff3e0;
+            border-bottom: 2px solid #ff9800;
+            text-align: center;
+            padding: 7px;
+            font-size: 11px;
+            font-weight: 700;
+            color: #e65100;
+            letter-spacing: 0.5px;
+        }
+
+        /* Bill Title Bar */
+        .bill-title-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: stretch;
+            border-bottom: 2px solid #e65100;
+            background: #fff8f5;
+        }
+
+        .bill-title-left {
+            background: #e65100;
+            color: white;
+            font-size: 14px;
+            font-weight: 700;
+            letter-spacing: 2px;
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            min-width: 200px;
+            justify-content: center;
+        }
+
+        .bill-title-right {
+            flex: 1;
+            padding: 8px 16px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            gap: 4px;
+        }
+
+        .bill-info-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .bill-info-label {
+            font-size: 10px;
+            color: #757575;
+            font-weight: 600;
+            min-width: 110px;
+        }
+
+        .bill-info-value {
+            font-size: 11px;
+            font-weight: 700;
+            color: #e65100;
+        }
+
+        /* Parties */
+        .parties-section {
+            display: flex;
+            border-bottom: 1px solid #bdbdbd;
+        }
+
+        .party-box {
+            flex: 1;
+            padding: 10px 14px;
+        }
+
+        .party-box:first-child {
+            border-right: 1px solid #bdbdbd;
+        }
+
+        .party-label {
+            font-size: 10px;
+            color: #757575;
+            font-weight: 600;
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+
+        .party-name {
+            font-size: 13px;
+            font-weight: 700;
+            color: #e65100;
+            margin-bottom: 2px;
+        }
+
+        .party-detail {
+            font-size: 10px;
+            color: #424242;
+            margin-bottom: 1px;
+            line-height: 1.5;
+        }
+
+        /* Items Table */
+        .items-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11px;
+        }
+
+        .items-table thead tr {
+            background: #e65100;
+            color: white;
+        }
+
+        .items-table thead th {
+            padding: 7px 6px;
+            text-align: center;
+            font-size: 10px;
+            font-weight: 700;
+            border: 1px solid #bf360c;
+        }
+
+        .items-table thead th.text-left {
+            text-align: left;
+            padding-left: 8px;
+        }
+
+        .items-table tbody tr:nth-child(even) {
+            background: #fff8f5;
+        }
+
+        .items-table tbody tr:nth-child(odd) {
+            background: #ffffff;
+        }
+
+        .items-table tbody td {
+            padding: 6px;
+            vertical-align: middle;
+            border: 1px solid #eeeeee;
+        }
+
+        .items-table tbody td.center {
+            text-align: center;
+        }
+
+        .items-table tbody td.right {
+            text-align: right;
+            font-family: 'Courier New', monospace;
+        }
+
+        .items-table tbody td.item-name {
+            font-weight: 600;
+        }
+
+        .items-table tbody tr.empty-row td {
+            padding: 4px;
+            color: transparent;
+            border-color: #f5f5f5;
+        }
+
+        /* Totals */
+        .totals-section {
+            display: flex;
+            justify-content: flex-end;
+            border-top: 2px solid #e65100;
+            border-bottom: 2px solid #e65100;
+        }
+
+        .totals-table {
+            width: 280px;
+            border-collapse: collapse;
+        }
+
+        .totals-table tr td {
+            padding: 6px 12px;
+            border: 1px solid #e0e0e0;
+        }
+
+        .totals-table tr td:first-child {
+            font-size: 11px;
+            color: #616161;
+            text-align: right;
+        }
+
+        .totals-table tr td:last-child {
+            font-size: 11px;
+            font-family: 'Courier New', monospace;
+            text-align: right;
+            font-weight: 700;
+        }
+
+        .totals-table tr.grand-total td {
+            background: #e65100;
+            color: white !important;
+            font-size: 13px !important;
+            font-weight: 700 !important;
+            padding: 9px 12px;
+        }
+
+        /* Amount in Words */
+        .amount-words-section {
+            padding: 8px 14px;
+            background: #fff3e0;
+            border-bottom: 1px solid #ffe0b2;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .amount-words-label {
+            font-size: 10px;
+            font-weight: 700;
+            color: #e65100;
+            white-space: nowrap;
+        }
+
+        .amount-words-text {
+            font-size: 11px;
+            font-weight: 700;
+            color: #bf360c;
+            font-style: italic;
+        }
+
+        /* Mandatory Composition Note */
+        .composition-mandatory-note {
+            text-align: center;
+            padding: 8px 14px;
+            background: #ffebee;
+            font-size: 11px;
+            font-weight: 700;
+            color: #c62828;
+            border-top: 2px solid #ef9a9a;
+            border-bottom: 2px solid #ef9a9a;
+            letter-spacing: 0.3px;
+        }
+
+        /* Footer */
+        .footer-section {
+            display: flex;
+            border-top: 1px solid #bdbdbd;
+        }
+
+        .footer-box {
+            flex: 1;
+            padding: 10px 14px;
+            border-right: 1px solid #bdbdbd;
+        }
+
+        .footer-box:last-child {
+            border-right: none;
+        }
+
+        .footer-title {
+            font-size: 10px;
+            font-weight: 700;
+            color: #e65100;
+            text-transform: uppercase;
+            margin-bottom: 5px;
+            border-bottom: 1px solid #ffe0b2;
+            padding-bottom: 3px;
+        }
+
+        .footer-detail {
+            font-size: 10px;
+            color: #424242;
+            line-height: 1.7;
+        }
+
+        .signature-space {
+            height: 45px;
+            border-bottom: 1px dashed #bdbdbd;
+            margin: 10px 0 4px;
+        }
+
+        .signature-label {
+            font-size: 10px;
+            color: #757575;
+            font-style: italic;
+            text-align: center;
+        }
+
+        .shop-seal {
+            font-size: 11px;
+            font-weight: 700;
+            color: #e65100;
+            text-align: center;
+            margin-top: 3px;
+        }
+
+        .bottom-note {
+            text-align: center;
+            padding: 6px;
+            background: #fff8f5;
+            font-size: 9px;
+            color: #9e9e9e;
+            border-top: 1px solid #ffe0b2;
+        }
+
+        /* Print button */
+        .print-bar {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            display: flex;
+            gap: 8px;
+            z-index: 1000;
+        }
+
+        .btn-print {
+            background: #e65100;
+            color: white;
+            border: none;
+            padding: 8px 18px;
+            font-size: 13px;
+            font-weight: 700;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        .btn-print:hover { background: #bf360c; }
+    </style>
+</head>
+<body>
+
+<div class="print-bar no-print">
+    <button class="btn-print"
+            onclick="window.print()">
+        🖨️ Print Bill
+    </button>
+    <button class="btn-print"
+            style="background:#616161"
+            onclick="window.close()">
+        ✕ Close
+    </button>
+</div>
+
+<div class="invoice-wrapper">
+
+    <!-- SHOP HEADER -->
+    <div class="shop-header">
+        <div class="shop-name">{{ shop_name }}</div>
+        <div class="shop-address">{{ shop_address }}</div>
+        <div class="shop-address">
+            {% if shop_phone %}📞 {{ shop_phone }}{% endif %}
+            {% if shop_email %}
+                &nbsp;|&nbsp; ✉ {{ shop_email }}
+            {% endif %}
+        </div>
+        <div class="shop-gstin">
+            GSTIN: {{ shop_gstin }}
+        </div>
+    </div>
+
+    <!-- COMPOSITION ALERT -->
+    <div class="composition-alert">
+        ⚠️ COMPOSITION TAXABLE PERSON —
+        NOT ELIGIBLE TO COLLECT TAX ON SUPPLIES
+    </div>
+
+    <!-- BILL TITLE BAR -->
+    <div class="bill-title-bar">
+        <div class="bill-title-left">
+            BILL OF SUPPLY
+        </div>
+        <div class="bill-title-right">
+            <div class="bill-info-row">
+                <span class="bill-info-label">
+                    Bill Number:
+                </span>
+                <span class="bill-info-value">
+                    {{ bill_number }}
+                </span>
+            </div>
+            <div class="bill-info-row">
+                <span class="bill-info-label">
+                    Bill Date:
+                </span>
+                <span class="bill-info-value">
+                    {{ bill_date }}
+                </span>
+            </div>
+            <div class="bill-info-row">
+                <span class="bill-info-label">
+                    Place of Supply:
+                </span>
+                <span class="bill-info-value">
+                    Karnataka (29)
+                </span>
+            </div>
+        </div>
+    </div>
+
+    <!-- PARTIES SECTION -->
+    <div class="parties-section">
+        <div class="party-box">
+            <div class="party-label">Bill To</div>
+            <div class="party-name">
+                {{ customer_name }}
+            </div>
+            {% if customer_address %}
+            <div class="party-detail">
+                {{ customer_address }}
+            </div>
+            {% endif %}
+            {% if customer_city %}
+            <div class="party-detail">
+                {{ customer_city }}, Karnataka
+            </div>
+            {% endif %}
+            {% if customer_phone %}
+            <div class="party-detail">
+                📞 {{ customer_phone }}
+            </div>
+            {% endif %}
+        </div>
+
+        <div class="party-box">
+            <div class="party-label">From</div>
+            <div class="party-name">{{ shop_name }}</div>
+            <div class="party-detail">
+                {{ shop_address }}
+            </div>
+            <div class="party-detail">
+                <strong>GSTIN:</strong> {{ shop_gstin }}
+            </div>
+            <div class="party-detail">
+                <strong>Scheme:</strong>
+                Composition Scheme
+            </div>
+        </div>
+    </div>
+
+    <!-- ITEMS TABLE -->
+    <table class="items-table">
+        <thead>
+            <tr>
+                <th style="width:5%">#</th>
+                <th class="text-left"
+                    style="width:38%">
+                    Item Description
+                </th>
+                <th style="width:10%">HSN/SAC</th>
+                <th style="width:9%">Qty</th>
+                <th style="width:8%">Unit</th>
+                <th style="width:12%">Rate (₹)</th>
+                <th style="width:18%">Amount (₹)</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for item in items %}
+            <tr>
+                <td class="center">
+                    {{ loop.index }}
+                </td>
+                <td class="item-name">
+                    {{ item.item_name }}
+                </td>
+                <td class="center"
+                    style="font-size:10px;
+                           color:#616161;">
+                    {% if item.hsn_code
+                          and item.hsn_code != '-' %}
+                        {{ item.hsn_code }}
+                    {% else %}
+                        —
+                    {% endif %}
+                </td>
+                <td class="center">
+                    {% if item.quantity ==
+                          item.quantity | int %}
+                        {{ item.quantity | int }}
+                    {% else %}
+                        {{ "%.2f" | format(
+                            item.quantity) }}
+                    {% endif %}
+                </td>
+                <td class="center">{{ item.unit }}</td>
+                <td class="right">
+                    {{ "%.2f" | format(
+                        item.selling_rate) }}
+                </td>
+                <td class="right"
+                    style="font-weight:700;
+                           color:#e65100;">
+                    {{ "%.2f" | format(
+                        item.total_amount) }}
+                </td>
+            </tr>
+            {% endfor %}
+
+            {% set filled = items | length %}
+            {% for i in range(
+                [8 - filled, 0] | max) %}
+            <tr class="empty-row">
+                <td>&nbsp;</td>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <!-- TOTALS -->
+    <div class="totals-section">
+        <table class="totals-table">
+            <tr>
+                <td>Total Amount:</td>
+                <td>
+                    ₹ {{ "%.2f" | format(grand_total) }}
+                </td>
+            </tr>
+            <tr class="grand-total">
+                <td>GRAND TOTAL:</td>
+                <td>
+                    ₹ {{ "%.2f" | format(grand_total) }}
+                </td>
+            </tr>
+        </table>
+    </div>
+
+    <!-- AMOUNT IN WORDS -->
+    <div class="amount-words-section">
+        <span class="amount-words-label">
+            Amount in Words:
+        </span>
+        <span class="amount-words-text">
+            {{ amount_in_words }}
+        </span>
+    </div>
+
+    <!-- MANDATORY COMPOSITION NOTE -->
+    <div class="composition-mandatory-note">
+        * This supplier is under Composition Scheme.
+        Tax amount is not separately charged.
+        Input Tax Credit is not available to the buyer.
+    </div>
+
+    <!-- FOOTER -->
+    <div class="footer-section">
+        <div class="footer-box">
+            <div class="footer-title">Bank Details</div>
+            <div class="footer-detail">
+                {% if bank_name %}
+                <strong>Bank:</strong>
+                {{ bank_name }}<br>
+                {% endif %}
+                {% if account_no %}
+                <strong>A/C No:</strong>
+                {{ account_no }}<br>
+                {% endif %}
+                {% if ifsc %}
+                <strong>IFSC:</strong>
+                {{ ifsc }}
+                {% endif %}
+                {% if not bank_name %}
+                Cash Payment
+                {% endif %}
+            </div>
+        </div>
+
+        <div class="footer-box">
+            <div class="footer-title">
+                Terms & Conditions
+            </div>
+            <div class="footer-detail">
+                1. Goods once sold will not be taken back.<br>
+                2. Subject to local jurisdiction.<br>
+                3. E. &amp; O.E.<br>
+                4. Payment due on delivery.
+            </div>
+        </div>
+
+        <div class="footer-box">
+            <div class="footer-title">
+                For {{ shop_name }}
+            </div>
+            <div class="signature-space"></div>
+            <div class="signature-label">
+                Authorised Signatory
+            </div>
+            <div class="shop-seal">
+                {{ shop_owner }}
+            </div>
+        </div>
+    </div>
+
+    <div class="bottom-note">
+        Bill No: {{ bill_number }} |
+        Computer generated bill |
+        {{ generated_on }}
+    </div>
+
+</div>
+</body>
+</html>

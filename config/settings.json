@@ -1,0 +1,48 @@
+{
+    "shop": {
+        "name": "SRI BYRAVESHWARA HARDWARE",
+        "owner_name": "Prof. Srinivas K",
+        "address_line1": "puneeth circle, market road",
+        "address_line2": "opp to kavery bekary",
+        "city": "kyalanur",
+        "state": "Karnataka",
+        "pincode": "563157",
+        "phone": "9902288878",
+        "email": "",
+        "gstin": "29DHQPK9219F1ZR",
+        "state_code": "29",
+        "pan": "ABCDE1234F"
+    },
+    "billing": {
+        "tax_scheme": "regular",
+        "bill_prefix": "INV",
+        "bill_start_number": 1,
+        "current_bill_number": 1,
+        "bill_year": 2026,
+        "default_margin_type": "range",
+        "default_margin_min": 10.0,
+        "default_margin_max": 20.0,
+        "default_margin_global": 15.0
+    },
+    "print": {
+        "paper_size": "both",
+        "thermal_width_mm": 80,
+        "printer_name": ""
+    },
+    "storage": {
+        "bills_root_folder": "bills",
+        "database_path": "database/shop_database.db",
+        "backup_enabled": true
+    },
+    "bank": {
+        "bank_name": "",
+        "account_name": "",
+        "account_no": "",
+        "ifsc": "",
+        "branch": ""
+    },
+    "app": {
+        "setup_complete": true,
+        "version": "1.0.0"
+    }
+}
