@@ -22,7 +22,9 @@
         "default_margin_type": "range",
         "default_margin_min": 10.0,
         "default_margin_max": 20.0,
-        "default_margin_global": 15.0
+        "default_margin_global": 15.0,
+        "flat_markup_amount": 5,
+        "target_profit_amount": 0
     },
     "print": {
         "paper_size": "both",

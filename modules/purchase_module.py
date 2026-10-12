@@ -22,6 +22,14 @@ import csv
 from pathlib import Path
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
+from modules.date_utils import (
+    DATE_PRESETS,
+    get_date_range_for_preset,
+    parse_flexible_date,
+    format_date_display,
+    format_date_iso,
+    get_month_dates,
+)
 
 # ============================================================
 # PATHS
@@ -2082,6 +2090,11 @@ class PurchaseFrame(tk.Frame):
         today = date.today()
         self.filter_month = tk.IntVar(value=today.month)
         self.filter_year  = tk.IntVar(value=today.year)
+        self.preset_var   = tk.StringVar(value="This Month")
+        s_date, e_date    = get_date_range_for_preset("This Month")
+        self.from_date_var = tk.StringVar(value=format_date_display(s_date) if s_date else "")
+        self.to_date_var   = tk.StringVar(value=format_date_display(e_date) if e_date else "")
+        self.include_carried_var = tk.BooleanVar(value=True)
 
         self._build_ui()
         self._load_bills()
@@ -2108,47 +2121,61 @@ class PurchaseFrame(tk.Frame):
         right.pack(side="right")
 
         tk.Label(
-            right, text="Month:",
+            right, text="Period:",
             font=FONTS["label_bold"],
             bg=COLORS["bg_main"],
             fg=COLORS["text_dark"]
-        ).pack(side="left", padx=(0, 5))
+        ).pack(side="left", padx=(0, 4))
 
-        self.month_cb = ttk.Combobox(
-            right, values=MONTH_NAMES[1:],
-            width=11, font=FONTS["body"],
+        self.preset_cb = ttk.Combobox(
+            right, values=DATE_PRESETS,
+            width=15, font=FONTS["body"],
             state="readonly"
         )
-        self.month_cb.set(
-            MONTH_NAMES[self.filter_month.get()]
-        )
-        self.month_cb.pack(side="left", padx=3)
-        self.month_cb.bind(
+        self.preset_cb.set(self.preset_var.get())
+        self.preset_cb.pack(side="left", padx=3)
+        self.preset_cb.bind(
             "<<ComboboxSelected>>",
-            lambda e: self._on_filter_change(
-                self.month_cb.get(), None
-            )
+            self._on_preset_selected
         )
 
-        current_year = date.today().year
-        self.year_cb = ttk.Combobox(
+        tk.Label(
+            right, text="From:",
+            font=FONTS["label"],
+            bg=COLORS["bg_main"],
+            fg=COLORS["text_muted"]
+        ).pack(side="left", padx=(6, 2))
+
+        self.from_ent = tk.Entry(
+            right, textvariable=self.from_date_var,
+            width=11, font=FONTS["body"]
+        )
+        self.from_ent.pack(side="left", padx=2)
+
+        tk.Label(
+            right, text="To:",
+            font=FONTS["label"],
+            bg=COLORS["bg_main"],
+            fg=COLORS["text_muted"]
+        ).pack(side="left", padx=(4, 2))
+
+        self.to_ent = tk.Entry(
+            right, textvariable=self.to_date_var,
+            width=11, font=FONTS["body"]
+        )
+        self.to_ent.pack(side="left", padx=2)
+
+        tk.Button(
             right,
-            values=[
-                str(y) for y in range(
-                    current_year - 3, current_year + 2
-                )
-            ],
-            width=7, font=FONTS["body"],
-            state="readonly"
-        )
-        self.year_cb.set(str(self.filter_year.get()))
-        self.year_cb.pack(side="left", padx=3)
-        self.year_cb.bind(
-            "<<ComboboxSelected>>",
-            lambda e: self._on_filter_change(
-                None, self.year_cb.get()
-            )
-        )
+            text="🔍 Filter",
+            font=FONTS["button"],
+            bg=COLORS["primary_light"],
+            fg="white",
+            relief="flat",
+            padx=10, pady=5,
+            cursor="hand2",
+            command=self._load_bills
+        ).pack(side="left", padx=(6, 10))
 
         tk.Button(
             right,
@@ -2157,19 +2184,33 @@ class PurchaseFrame(tk.Frame):
             bg=COLORS["success"],
             fg="white",
             relief="flat",
-            padx=15, pady=8,
+            padx=14, pady=8,
             cursor="hand2",
             command=self._open_add_dialog
-        ).pack(side="left", padx=(15, 0))
+        ).pack(side="left", padx=(5, 0))
 
-    def _on_filter_change(self, month_name, year_str):
-        if month_name:
-            self.filter_month.set(
-                MONTH_NAMES.index(month_name)
-            )
-        if year_str:
-            self.filter_year.set(int(year_str))
+    def _on_preset_selected(self, event=None):
+        preset = self.preset_cb.get()
+        self.preset_var.set(preset)
+        s, e = get_date_range_for_preset(preset)
+        if s:
+            self.from_date_var.set(format_date_display(s))
+            self.filter_month.set(s.month)
+            self.filter_year.set(s.year)
+        else:
+            self.from_date_var.set("")
+        if e:
+            self.to_date_var.set(format_date_display(e))
+        else:
+            self.to_date_var.set("")
         self._load_bills()
+
+    def _get_active_date_range(self):
+        s_raw = self.from_date_var.get().strip()
+        e_raw = self.to_date_var.get().strip()
+        s_date = parse_flexible_date(s_raw) if s_raw else None
+        e_date = parse_flexible_date(e_raw) if e_raw else None
+        return s_date, e_date
 
     def _build_summary_bar(self):
         bar = tk.Frame(
@@ -2183,10 +2224,10 @@ class PurchaseFrame(tk.Frame):
             bg=COLORS["primary"], fg="white"
         )
         self.lbl_summary_bills.pack(
-            side="left", padx=20
+            side="left", padx=15
         )
 
-        for sep_text in ["|", "|", "|"]:
+        for sep_text in ["|", "|", "|", "|"]:
             tk.Label(
                 bar, text=sep_text,
                 font=FONTS["body"],
@@ -2200,7 +2241,7 @@ class PurchaseFrame(tk.Frame):
             bg=COLORS["primary"], fg="white"
         )
         self.lbl_summary_taxable.pack(
-            side="left", padx=20
+            side="left", padx=15
         )
 
         self.lbl_summary_gst = tk.Label(
@@ -2209,7 +2250,7 @@ class PurchaseFrame(tk.Frame):
             bg=COLORS["primary"], fg="#90caf9"
         )
         self.lbl_summary_gst.pack(
-            side="left", padx=20
+            side="left", padx=15
         )
 
         self.lbl_summary_total = tk.Label(
@@ -2218,7 +2259,16 @@ class PurchaseFrame(tk.Frame):
             bg=COLORS["primary"], fg="#a5d6a7"
         )
         self.lbl_summary_total.pack(
-            side="left", padx=20
+            side="left", padx=15
+        )
+
+        self.lbl_summary_stock = tk.Label(
+            bar, text="Active Unsold Stock: ₹0.00",
+            font=FONTS["body_bold"],
+            bg=COLORS["primary"], fg="#ffcc80"
+        )
+        self.lbl_summary_stock.pack(
+            side="left", padx=15
         )
 
     def _build_bills_table(self):
@@ -2244,11 +2294,12 @@ class PurchaseFrame(tk.Frame):
         hdr.pack(fill="x")
 
         for col, width in [
-            ("#", 4), ("Dealer", 22),
-            ("Bill No", 14), ("Date", 12),
-            ("Items", 6), ("Taxable", 12),
-            ("GST", 10), ("Total", 13),
-            ("Actions", 20),
+            ("#", 4), ("Dealer", 20),
+            ("Bill No", 14), ("Date", 11),
+            ("Items", 6), ("Taxable", 11),
+            ("GST", 9), ("Total", 12),
+            ("Stock Status", 13),
+            ("Actions", 16),
         ]:
             tk.Label(
                 hdr, text=col,
@@ -2310,20 +2361,22 @@ class PurchaseFrame(tk.Frame):
 
         tk.Label(
             title_row,
-            text="📦 Monthly Stock Pool",
+            text="📦 Active Stock Pool & Inventory Balance",
             font=FONTS["subheading"],
             bg=COLORS["bg_card"],
             fg=COLORS["text_dark"]
         ).pack(side="left")
 
-        tk.Label(
+        tk.Checkbutton(
             title_row,
-            text="(All items this month — "
-                 "used for generating sales bills)",
-            font=FONTS["small"],
+            text="Include carried-forward unsold stock from earlier purchases",
+            variable=self.include_carried_var,
+            font=FONTS["label"],
             bg=COLORS["bg_card"],
-            fg=COLORS["text_muted"]
-        ).pack(side="left", padx=10)
+            fg=COLORS["primary"],
+            activebackground=COLORS["bg_card"],
+            command=self._load_bills
+        ).pack(side="right", padx=10)
 
         phdr = tk.Frame(
             pool, bg=COLORS["primary_light"]
@@ -2331,10 +2384,11 @@ class PurchaseFrame(tk.Frame):
         phdr.pack(fill="x", pady=(8, 0))
 
         for col, width in [
-            ("Item Name", 25), ("HSN", 10),
-            ("Total Qty", 10), ("Unit", 8),
-            ("Avg Rate", 10), ("Remaining", 10),
-            ("GST%", 6), ("Status", 10),
+            ("Item Name", 24), ("HSN", 10),
+            ("Purchased Qty", 11), ("Unit", 8),
+            ("Buy Rate", 10), ("Remaining", 10),
+            ("Remaining ₹", 12), ("GST%", 6),
+            ("Stock Status", 13),
         ]:
             tk.Label(
                 phdr, text=col,
@@ -2350,65 +2404,95 @@ class PurchaseFrame(tk.Frame):
         self.pool_body.pack(fill="x")
 
     def _load_bills(self):
-        month = self.filter_month.get()
-        year  = self.filter_year.get()
-
         for w in self.bills_body.winfo_children():
             w.destroy()
 
-        bills = db.query("""
+        s_date, e_date = self._get_active_date_range()
+        conditions = []
+        params = []
+
+        if s_date:
+            conditions.append("pb.bill_date >= ?")
+            params.append(format_date_iso(s_date))
+        if e_date:
+            conditions.append("pb.bill_date <= ?")
+            params.append(format_date_iso(e_date))
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        bills = db.query(f"""
             SELECT pb.*,
               (SELECT COUNT(*) FROM purchase_items pi
-               WHERE pi.purchase_bill_id = pb.id)
-               AS item_count
+               WHERE pi.purchase_bill_id = pb.id) AS item_count,
+              (SELECT COALESCE(SUM(pi.quantity), 0) FROM purchase_items pi
+               WHERE pi.purchase_bill_id = pb.id) AS total_qty,
+              (SELECT COALESCE(SUM(pi.remaining_qty), 0) FROM purchase_items pi
+               WHERE pi.purchase_bill_id = pb.id) AS remaining_qty,
+              (SELECT COALESCE(SUM(pi.remaining_qty * pi.purchase_rate), 0) FROM purchase_items pi
+               WHERE pi.purchase_bill_id = pb.id) AS unsold_val
             FROM purchase_bills pb
-            WHERE pb.bill_month=? AND pb.bill_year=?
-            ORDER BY pb.bill_date, pb.id
-        """, (month, year))
+            {where_clause}
+            ORDER BY pb.bill_date DESC, pb.id DESC
+        """, tuple(params))
 
-        totals = db.query_one("""
+        totals = db.query_one(f"""
             SELECT COUNT(*) AS cnt,
-              COALESCE(SUM(subtotal),0) AS taxable,
-              COALESCE(SUM(total_gst),0) AS gst,
-              COALESCE(SUM(grand_total),0) AS total
-            FROM purchase_bills
-            WHERE bill_month=? AND bill_year=?
-        """, (month, year))
+              COALESCE(SUM(subtotal), 0) AS taxable,
+              COALESCE(SUM(total_gst), 0) AS gst,
+              COALESCE(SUM(grand_total), 0) AS total
+            FROM purchase_bills pb
+            {where_clause}
+        """, tuple(params))
+
+        # Overall active inventory on hand up to e_date
+        stock_params = []
+        stock_cond = ["pi.remaining_qty > 0.0001"]
+        if e_date:
+            stock_cond.append("pb.bill_date <= ?")
+            stock_params.append(format_date_iso(e_date))
+        stock_summary = db.query_one(f"""
+            SELECT COALESCE(SUM(pi.remaining_qty * pi.purchase_rate), 0) AS active_val,
+                   COALESCE(SUM(pi.remaining_qty), 0) AS active_units
+            FROM purchase_items pi
+            JOIN purchase_bills pb ON pi.purchase_bill_id = pb.id
+            WHERE {' AND '.join(stock_cond)}
+        """, tuple(stock_params))
 
         self.lbl_summary_bills.configure(
             text=f"Bills: {totals.get('cnt', 0)}"
         )
         self.lbl_summary_taxable.configure(
-            text=f"Taxable: "
-                 f"₹{totals.get('taxable', 0):,.2f}"
+            text=f"Taxable: ₹{totals.get('taxable', 0):,.2f}"
         )
         self.lbl_summary_gst.configure(
             text=f"GST: ₹{totals.get('gst', 0):,.2f}"
         )
         self.lbl_summary_total.configure(
-            text=f"Grand Total: "
-                 f"₹{totals.get('total', 0):,.2f}"
+            text=f"Grand Total: ₹{totals.get('total', 0):,.2f}"
+        )
+        self.lbl_summary_stock.configure(
+            text=f"Active Unsold Stock: ₹{stock_summary.get('active_val', 0):,.2f}"
         )
 
         if not bills:
+            range_desc = f"{self.from_date_var.get()} to {self.to_date_var.get()}" if s_date or e_date else "selected range"
             tk.Label(
                 self.bills_body,
                 text=(
-                    f"No purchase bills found for\n"
-                    f"{MONTH_NAMES[month]} {year}.\n\n"
-                    "Click '➕ Add Purchase Bill'"
+                    f"No purchase bills found for {range_desc}.\n\n"
+                    "Click '➕ Add Purchase Bill' or change the period filter."
                 ),
                 font=FONTS["body"],
                 bg=COLORS["bg_card"],
                 fg=COLORS["text_muted"],
                 justify="center"
             ).pack(pady=30)
-            self._load_pool(month, year)
+            self._load_pool(s_date, e_date)
             return
 
         for i, bill in enumerate(bills):
             self._render_bill_row(bill, i)
-        self._load_pool(month, year)
+        self._load_pool(s_date, e_date)
 
     def _render_bill_row(self, bill, idx):
         bg = (
@@ -2427,20 +2511,35 @@ class PurchaseFrame(tk.Frame):
         except Exception:
             date_str = bill["bill_date"]
 
-        for text, width in [
-            (str(idx + 1),               4),
-            (bill["dealer_name"],        22),
-            (bill["bill_number"],        14),
-            (date_str,                   12),
-            (str(bill["item_count"]),     6),
-            (f"₹{bill['subtotal']:,.0f}",12),
-            (f"₹{bill['total_gst']:,.0f}",10),
-            (f"₹{bill['grand_total']:,.0f}",13),
+        # Stock status badge for this purchase bill
+        tot_q = float(bill.get("total_qty") or 0)
+        rem_q = float(bill.get("remaining_qty") or 0)
+        if rem_q <= 0.0001:
+            stock_badge = "✅ Sold Out"
+            badge_color = COLORS["success"]
+        elif rem_q >= tot_q - 0.0001:
+            stock_badge = "📦 In Stock"
+            badge_color = COLORS["accent"]
+        else:
+            stock_badge = f"⚠️ Partial ({rem_q:.1f} left)"
+            badge_color = COLORS["warning"]
+
+        for text, width, color in [
+            (str(idx + 1),               4, COLORS["text_dark"]),
+            (bill["dealer_name"],        20, COLORS["text_dark"]),
+            (bill["bill_number"],        14, COLORS["text_dark"]),
+            (date_str,                   11, COLORS["text_dark"]),
+            (str(bill["item_count"]),     6, COLORS["text_dark"]),
+            (f"₹{bill['subtotal']:,.0f}",11, COLORS["text_dark"]),
+            (f"₹{bill['total_gst']:,.0f}", 9, COLORS["text_dark"]),
+            (f"₹{bill['grand_total']:,.0f}", 12, COLORS["text_dark"]),
+            (stock_badge,                13, badge_color),
         ]:
+            font_to_use = FONTS["table_bold"] if width == 13 else FONTS["table"]
             tk.Label(
                 row, text=text,
-                font=FONTS["table"],
-                bg=bg, fg=COLORS["text_dark"],
+                font=font_to_use,
+                bg=bg, fg=color,
                 width=width, anchor="w",
                 padx=5, pady=6
             ).pack(side="left")
@@ -2476,28 +2575,47 @@ class PurchaseFrame(tk.Frame):
             command=lambda b=bid: self._delete_bill(b)
         ).pack(side="left", padx=2)
 
-    def _load_pool(self, month, year):
+    def _load_pool(self, s_date, e_date):
         for w in self.pool_body.winfo_children():
             w.destroy()
 
-        items = db.query("""
+        conds = []
+        params = []
+        if self.include_carried_var.get():
+            # Include all unsold stock up to e_date OR stock purchased in this period
+            if e_date:
+                conds.append("pb.bill_date <= ?")
+                params.append(format_date_iso(e_date))
+            conds.append("(pi.remaining_qty > 0.0001 OR (1=1" + (f" AND pb.bill_date >= '{format_date_iso(s_date)}'" if s_date else "") + "))")
+        else:
+            if s_date:
+                conds.append("pb.bill_date >= ?")
+                params.append(format_date_iso(s_date))
+            if e_date:
+                conds.append("pb.bill_date <= ?")
+                params.append(format_date_iso(e_date))
+
+        where_clause = f"WHERE {' AND '.join(conds)}" if conds else ""
+
+        items = db.query(f"""
             SELECT pi.item_name, pi.hsn_code,
               pi.unit, pi.gst_rate,
               SUM(pi.quantity) AS total_qty,
               SUM(pi.remaining_qty) AS remaining_qty,
-              AVG(pi.purchase_rate) AS avg_rate
+              AVG(pi.purchase_rate) AS avg_rate,
+              SUM(pi.remaining_qty * pi.purchase_rate) AS rem_val
             FROM purchase_items pi
             JOIN purchase_bills pb
               ON pi.purchase_bill_id = pb.id
-            WHERE pb.bill_month=? AND pb.bill_year=?
+            {where_clause}
             GROUP BY pi.item_name, pi.unit
-            ORDER BY pi.item_name
-        """, (month, year))
+            ORDER BY remaining_qty DESC, pi.item_name ASC
+        """, tuple(params))
 
         if not items:
             tk.Label(
                 self.pool_body,
-                text="No items yet. Add purchase bills.",
+                text="No active items in stock for this period.",
                 font=FONTS["body"],
                 bg=COLORS["bg_card"],
                 fg=COLORS["text_muted"]
@@ -2513,27 +2631,29 @@ class PurchaseFrame(tk.Frame):
             row = tk.Frame(self.pool_body, bg=bg)
             row.pack(fill="x")
 
-            remaining = item["remaining_qty"] or 0
-            total     = item["total_qty"] or 0
+            remaining = float(item["remaining_qty"] or 0)
+            total     = float(item["total_qty"] or 0)
+            rem_val   = float(item["rem_val"] or 0)
             status = (
-                "✅ Done" if remaining == 0 else
-                "⚠️ Partial" if remaining < total else
-                "📦 Pending"
+                "✅ Sold Out" if remaining <= 0.0001 else
+                "⚠️ Partial" if remaining < total - 0.0001 else
+                "📦 In Stock"
             )
             sc = (
-                COLORS["success"] if remaining == 0
+                COLORS["success"] if remaining <= 0.0001
                 else COLORS["warning"]
-                if remaining < total
-                else COLORS["text_muted"]
+                if remaining < total - 0.0001
+                else COLORS["accent"]
             )
 
             for text, width in [
-                (item["item_name"],          25),
+                (item["item_name"],          24),
                 (item["hsn_code"] or "-",    10),
-                (f"{total:.1f}",             10),
+                (f"{total:.1f}",             11),
                 (item["unit"],                8),
                 (f"₹{item['avg_rate']:.2f}", 10),
                 (f"{remaining:.1f}",         10),
+                (f"₹{rem_val:,.2f}",         12),
                 (f"{item['gst_rate']:.0f}%",  6),
             ]:
                 tk.Label(
@@ -2548,7 +2668,7 @@ class PurchaseFrame(tk.Frame):
                 row, text=status,
                 font=FONTS["table_bold"],
                 bg=bg, fg=sc,
-                width=10, anchor="w", padx=5
+                width=13, anchor="w", padx=5
             ).pack(side="left")
 
     def _open_add_dialog(self):

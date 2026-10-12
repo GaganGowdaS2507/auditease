@@ -31,6 +31,15 @@ from pathlib import Path
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from collections import defaultdict
+from modules.date_utils import (
+    DATE_PRESETS,
+    get_date_range_for_preset,
+    parse_flexible_date,
+    format_date_display,
+    format_date_iso,
+    get_month_dates,
+    get_financial_year,
+)
 
 # ============================================================
 # PATHS
@@ -175,38 +184,68 @@ class ReportDataFetcher:
     # MONTHLY DATA
     # ----------------------------------------------------------
     def get_monthly_data(
-        self, month: int, year: int
+        self,
+        month: int = None,
+        year: int = None,
+        start_date = None,
+        end_date = None,
     ) -> dict:
-        """Fetch all data needed for monthly report"""
+        """Fetch all data needed for period report (custom date range or month/year)"""
+        if isinstance(start_date, str) and start_date.strip():
+            start_date = parse_flexible_date(start_date)
+        if isinstance(end_date, str) and end_date.strip():
+            end_date = parse_flexible_date(end_date)
+
+        if not start_date and not end_date and month and year:
+            start_date, end_date = get_month_dates(year, month)
+
+        conds_p = []
+        conds_s = []
+        params_p = []
+        params_s = []
+
+        if start_date:
+            conds_p.append("pb.bill_date >= ?")
+            params_p.append(format_date_iso(start_date))
+            conds_s.append("sb.bill_date >= ?")
+            params_s.append(format_date_iso(start_date))
+        if end_date:
+            conds_p.append("pb.bill_date <= ?")
+            params_p.append(format_date_iso(end_date))
+            conds_s.append("sb.bill_date <= ?")
+            params_s.append(format_date_iso(end_date))
+
+        where_p = f"WHERE {' AND '.join(conds_p)}" if conds_p else ""
+        where_s = f"WHERE {' AND '.join(conds_s)}" if conds_s else ""
 
         # Purchase summary
-        purchase = db.query_one("""
+        purchase = db.query_one(f"""
             SELECT
-                COUNT(*)                   AS bill_count,
-                COUNT(DISTINCT dealer_name) AS dealer_count,
+                COUNT(*)                     AS bill_count,
+                COUNT(DISTINCT dealer_name)  AS dealer_count,
                 COALESCE(SUM(subtotal),    0) AS taxable,
                 COALESCE(SUM(total_gst),   0) AS gst,
                 COALESCE(SUM(grand_total), 0) AS total
-            FROM purchase_bills
-            WHERE bill_month=? AND bill_year=?
-        """, (month, year))
+            FROM purchase_bills pb
+            {where_p}
+        """, tuple(params_p))
 
         # Sales summary
-        sales = db.query_one("""
+        sales = db.query_one(f"""
             SELECT
-                COUNT(*)                     AS bill_count,
-                COUNT(DISTINCT customer_name) AS customer_count,
+                COUNT(*)                       AS bill_count,
+                COUNT(DISTINCT customer_name)  AS customer_count,
                 COALESCE(SUM(subtotal),      0) AS taxable,
                 COALESCE(SUM(total_cgst),    0) AS cgst,
                 COALESCE(SUM(total_sgst),    0) AS sgst,
                 COALESCE(SUM(grand_total),   0) AS total,
                 AVG(grand_total)               AS avg_bill
-            FROM sales_bills
-            WHERE bill_month=? AND bill_year=?
-        """, (month, year))
+            FROM sales_bills sb
+            {where_s}
+        """, tuple(params_s))
 
         # Item-wise purchase pool
-        purchase_items = db.query("""
+        purchase_items = db.query(f"""
             SELECT
                 pi.item_name,
                 pi.hsn_code,
@@ -219,93 +258,130 @@ class ReportDataFetcher:
             FROM purchase_items pi
             JOIN purchase_bills pb
                 ON pi.purchase_bill_id = pb.id
-            WHERE pb.bill_month=? AND pb.bill_year=?
+            {where_p}
             GROUP BY pi.item_name, pi.unit
             ORDER BY purchase_total DESC
-        """, (month, year))
+        """, tuple(params_p))
 
         # Item-wise sales
-        sales_items = db.query("""
+        sales_items = db.query(f"""
             SELECT
                 si.item_name,
                 si.hsn_code,
                 si.unit,
                 si.gst_rate,
-                SUM(si.quantity)      AS sold_qty,
-                AVG(si.selling_rate)  AS avg_sell_rate,
-                SUM(si.taxable_amount) AS taxable,
-                SUM(si.cgst_amount)   AS cgst,
-                SUM(si.sgst_amount)   AS sgst,
-                SUM(si.total_amount)  AS sales_total,
+                SUM(si.quantity)       AS sold_qty,
+                AVG(si.selling_rate)   AS avg_sell_rate,
+                SUM(si.quantity * si.selling_rate) AS taxable,
+                SUM(si.cgst_amount)    AS cgst,
+                SUM(si.sgst_amount)    AS sgst,
+                SUM(si.total_amount)   AS sales_total,
                 AVG(si.margin_percent) AS avg_margin
             FROM sales_items si
             JOIN sales_bills sb
                 ON si.sales_bill_id = sb.id
-            WHERE sb.bill_month=? AND sb.bill_year=?
+            {where_s}
             GROUP BY si.item_name, si.unit
             ORDER BY sales_total DESC
-        """, (month, year))
+        """, tuple(params_s))
 
         # GST summary by rate
-        gst_summary = db.query("""
+        gst_summary = db.query(f"""
             SELECT
                 si.gst_rate,
-                SUM(si.taxable_amount) AS taxable,
-                SUM(si.cgst_amount)    AS cgst,
-                SUM(si.sgst_amount)    AS sgst
+                SUM(si.quantity * si.selling_rate) AS taxable,
+                SUM(si.cgst_amount)                AS cgst,
+                SUM(si.sgst_amount)                AS sgst
             FROM sales_items si
             JOIN sales_bills sb
                 ON si.sales_bill_id = sb.id
-            WHERE sb.bill_month=? AND sb.bill_year=?
+            {where_s}
             GROUP BY si.gst_rate
             ORDER BY si.gst_rate
-        """, (month, year))
+        """, tuple(params_s))
 
         # GST input by rate (from purchases)
-        input_gst = db.query("""
+        input_gst = db.query(f"""
             SELECT
                 pi.gst_rate,
-                SUM(pi.quantity * pi.purchase_rate)
-                    AS taxable,
-                SUM(pi.gst_amount) AS gst
+                SUM(pi.quantity * pi.purchase_rate) AS taxable,
+                SUM(pi.gst_amount)                  AS gst
             FROM purchase_items pi
             JOIN purchase_bills pb
                 ON pi.purchase_bill_id = pb.id
-            WHERE pb.bill_month=? AND pb.bill_year=?
+            {where_p}
             GROUP BY pi.gst_rate
             ORDER BY pi.gst_rate
-        """, (month, year))
+        """, tuple(params_p))
 
         # Top 5 sales bills
-        top_bills = db.query("""
+        top_bills = db.query(f"""
             SELECT
                 bill_number,
                 customer_name,
                 bill_date,
                 grand_total
-            FROM sales_bills
-            WHERE bill_month=? AND bill_year=?
+            FROM sales_bills sb
+            {where_s}
             ORDER BY grand_total DESC
             LIMIT 5
-        """, (month, year))
+        """, tuple(params_s))
+
+        # Cost of goods sold (COGS) for goods sold in this period
+        cogs_row = db.query_one(f"""
+            SELECT
+                COALESCE(SUM(si.quantity * pi.purchase_rate), 0) AS cogs
+            FROM sales_items si
+            JOIN sales_bills sb ON si.sales_bill_id = sb.id
+            LEFT JOIN purchase_items pi ON si.purchase_item_id = pi.id
+            {where_s}
+        """, tuple(params_s))
+        cogs = cogs_row.get("cogs", 0)
+
+        # Active Closing Stock on Hand (as of end_date)
+        stock_params = []
+        stock_cond = ["pi.remaining_qty > 0.0001"]
+        if end_date:
+            stock_cond.append("pb.bill_date <= ?")
+            stock_params.append(format_date_iso(end_date))
+
+        closing_stock = db.query_one(f"""
+            SELECT
+                COALESCE(SUM(pi.remaining_qty * pi.purchase_rate), 0) AS closing_val,
+                COALESCE(SUM(pi.remaining_qty), 0)                    AS closing_units
+            FROM purchase_items pi
+            JOIN purchase_bills pb ON pi.purchase_bill_id = pb.id
+            WHERE {' AND '.join(stock_cond)}
+        """, tuple(stock_params))
 
         # Calculations
-        p_taxable  = purchase.get("taxable", 0)
-        s_taxable  = sales.get("taxable", 0)
-        p_gst      = purchase.get("gst", 0)
-        s_cgst     = sales.get("cgst", 0)
-        s_sgst     = sales.get("sgst", 0)
-        s_gst      = s_cgst + s_sgst
-        profit     = round2(s_taxable - p_taxable)
+        p_taxable   = purchase.get("taxable", 0)
+        s_taxable   = sales.get("taxable", 0)
+        p_gst       = purchase.get("gst", 0)
+        s_cgst      = sales.get("cgst", 0)
+        s_sgst      = sales.get("sgst", 0)
+        s_gst       = s_cgst + s_sgst
+
+        if sales.get("bill_count", 0) == 0 or s_taxable <= 0:
+            profit = 0.0
+            margin_pct = 0.0
+        elif cogs > 0:
+            profit = round2(s_taxable - cogs)
+            margin_pct = round2(profit / cogs * 100) if cogs > 0 else 0
+        else:
+            profit = round2(s_taxable - p_taxable)
+            margin_pct = round2(profit / p_taxable * 100) if p_taxable > 0 else 0
+
         gst_payable = round2(max(0, s_gst - p_gst))
-        margin_pct = (
-            round2(profit / p_taxable * 100)
-            if p_taxable > 0 else 0
-        )
+
+        disp_month = start_date.month if start_date else (month or date.today().month)
+        disp_year  = start_date.year if start_date else (year or date.today().year)
 
         return {
-            "month":          month,
-            "year":           year,
+            "month":          disp_month,
+            "year":           disp_year,
+            "start_date":     start_date,
+            "end_date":       end_date,
             "purchase":       purchase,
             "sales":          sales,
             "purchase_items": purchase_items,
@@ -314,6 +390,9 @@ class ReportDataFetcher:
             "input_gst":      input_gst,
             "top_bills":      top_bills,
             "profit":         profit,
+            "cogs":           cogs,
+            "closing_val":    closing_stock.get("closing_val", 0),
+            "closing_units":  closing_stock.get("closing_units", 0),
             "gst_payable":    gst_payable,
             "margin_pct":     margin_pct,
             "p_gst":          p_gst,
@@ -492,12 +571,15 @@ class ReportFrame(tk.Frame):
         self.fetcher  = ReportDataFetcher()
 
         today = date.today()
+        self.preset_var = tk.StringVar(value="This Month")
+        s_date, e_date = get_date_range_for_preset("This Month")
+        self.from_date_var = tk.StringVar(value=format_date_display(s_date) if s_date else "")
+        self.to_date_var   = tk.StringVar(value=format_date_display(e_date) if e_date else "")
         self.view_month = tk.IntVar(value=today.month)
         self.view_year  = tk.IntVar(value=today.year)
         self.active_tab = tk.StringVar(value="monthly")
 
         self._build_ui()
-        self._load_monthly_report()
 
     # ----------------------------------------------------------
     # BUILD UI
@@ -506,6 +588,7 @@ class ReportFrame(tk.Frame):
         self._build_top_bar()
         self._build_tab_bar()
         self._build_scroll_area()
+        self._switch_tab("monthly")
 
     def _build_top_bar(self):
         top = tk.Frame(self, bg=COLORS["bg_main"])
@@ -523,55 +606,72 @@ class ReportFrame(tk.Frame):
         right = tk.Frame(top, bg=COLORS["bg_main"])
         right.pack(side="right")
 
-        # Month selector
         tk.Label(
             right,
-            text="Month:",
+            text="Period:",
             font=FONTS["label_bold"],
             bg=COLORS["bg_main"],
             fg=COLORS["text_dark"]
-        ).pack(side="left", padx=(0, 5))
+        ).pack(side="left", padx=(0, 4))
 
-        self.month_cb = ttk.Combobox(
+        self.preset_cb = ttk.Combobox(
             right,
-            values=MONTH_NAMES[1:],
+            values=DATE_PRESETS,
+            width=15,
+            font=FONTS["body"],
+            state="readonly"
+        )
+        self.preset_cb.set(self.preset_var.get())
+        self.preset_cb.pack(side="left", padx=3)
+        self.preset_cb.bind(
+            "<<ComboboxSelected>>",
+            self._on_preset_change
+        )
+
+        tk.Label(
+            right,
+            text="From:",
+            font=FONTS["label"],
+            bg=COLORS["bg_main"],
+            fg=COLORS["text_muted"]
+        ).pack(side="left", padx=(6, 2))
+
+        self.from_ent = tk.Entry(
+            right,
+            textvariable=self.from_date_var,
             width=11,
-            font=FONTS["body"],
-            state="readonly"
+            font=FONTS["body"]
         )
-        self.month_cb.set(
-            MONTH_NAMES[self.view_month.get()]
-        )
-        self.month_cb.pack(side="left", padx=3)
-        self.month_cb.bind(
-            "<<ComboboxSelected>>",
-            lambda e: self._on_month_change(
-                self.month_cb.get()
-            )
-        )
+        self.from_ent.pack(side="left", padx=2)
 
-        # Year selector
-        current_year = date.today().year
-        self.year_cb = ttk.Combobox(
+        tk.Label(
             right,
-            values=[
-                str(y) for y in range(
-                    current_year - 3,
-                    current_year + 2
-                )
-            ],
-            width=7,
-            font=FONTS["body"],
-            state="readonly"
+            text="To:",
+            font=FONTS["label"],
+            bg=COLORS["bg_main"],
+            fg=COLORS["text_muted"]
+        ).pack(side="left", padx=(4, 2))
+
+        self.to_ent = tk.Entry(
+            right,
+            textvariable=self.to_date_var,
+            width=11,
+            font=FONTS["body"]
         )
-        self.year_cb.set(str(self.view_year.get()))
-        self.year_cb.pack(side="left", padx=3)
-        self.year_cb.bind(
-            "<<ComboboxSelected>>",
-            lambda e: self._on_year_change(
-                self.year_cb.get()
-            )
-        )
+        self.to_ent.pack(side="left", padx=2)
+
+        tk.Button(
+            right,
+            text="🔍 View",
+            font=FONTS["button"],
+            bg=COLORS["primary_light"],
+            fg="white",
+            relief="flat",
+            padx=10,
+            pady=5,
+            cursor="hand2",
+            command=self._apply_period_filter
+        ).pack(side="left", padx=(6, 8))
 
         # Export buttons
         tk.Button(
@@ -581,10 +681,11 @@ class ReportFrame(tk.Frame):
             bg=COLORS["danger"],
             fg="white",
             relief="flat",
-            padx=12, pady=6,
+            padx=12,
+            pady=6,
             cursor="hand2",
             command=self._export_pdf
-        ).pack(side="left", padx=(10, 3))
+        ).pack(side="left", padx=(4, 3))
 
         tk.Button(
             right,
@@ -593,10 +694,43 @@ class ReportFrame(tk.Frame):
             bg=COLORS["success"],
             fg="white",
             relief="flat",
-            padx=12, pady=6,
+            padx=12,
+            pady=6,
             cursor="hand2",
             command=self._export_csv
         ).pack(side="left", padx=3)
+
+    def _on_preset_change(self, event=None):
+        preset = self.preset_cb.get()
+        self.preset_var.set(preset)
+        s, e = get_date_range_for_preset(preset)
+        if s:
+            self.from_date_var.set(format_date_display(s))
+            self.view_month.set(s.month)
+            self.view_year.set(s.year)
+        else:
+            self.from_date_var.set("")
+        if e:
+            self.to_date_var.set(format_date_display(e))
+        else:
+            self.to_date_var.set("")
+        self._apply_period_filter()
+
+    def _apply_period_filter(self):
+        tab = self.active_tab.get()
+        if tab == "monthly":
+            self._load_monthly_report()
+        elif tab == "annual":
+            self._load_annual_report()
+        elif tab == "gstr":
+            self._load_gstr_summary()
+
+    def _get_active_date_range(self):
+        s_raw = self.from_date_var.get().strip()
+        e_raw = self.to_date_var.get().strip()
+        s_date = parse_flexible_date(s_raw) if s_raw else None
+        e_date = parse_flexible_date(e_raw) if e_raw else None
+        return s_date, e_date
 
     def _build_tab_bar(self):
         """Monthly / Annual tab switcher"""
@@ -631,8 +765,6 @@ class ReportFrame(tk.Frame):
             bg=COLORS["primary"],
             height=2
         ).pack(fill="x", padx=25)
-
-        self._switch_tab("monthly")
 
     def _switch_tab(self, tab_key: str):
         """Switch report tab"""
@@ -707,9 +839,11 @@ class ReportFrame(tk.Frame):
         )
 
     def _clear_content(self):
-        for w in self.content.winfo_children():
-            w.destroy()
-        self.canvas.yview_moveto(0)
+        if hasattr(self, "content") and self.content:
+            for w in self.content.winfo_children():
+                w.destroy()
+        if hasattr(self, "canvas") and self.canvas:
+            self.canvas.yview_moveto(0)
 
     def _on_month_change(self, month_name):
         self.view_month.set(
@@ -731,16 +865,18 @@ class ReportFrame(tk.Frame):
             self._load_gstr_summary()
 
     # ----------------------------------------------------------
-    # MONTHLY REPORT
+    # MONTHLY / PERIOD REPORT
     # ----------------------------------------------------------
     def _load_monthly_report(self):
-        """Build and display monthly report"""
+        """Build and display period report"""
         self._clear_content()
 
-        month = self.view_month.get()
-        year  = self.view_year.get()
-        data  = self.fetcher.get_monthly_data(
-            month, year
+        s_date, e_date = self._get_active_date_range()
+        data = self.fetcher.get_monthly_data(
+            month=s_date.month if s_date else self.view_month.get(),
+            year=s_date.year if s_date else self.view_year.get(),
+            start_date=s_date,
+            end_date=e_date,
         )
 
         self._render_monthly_header(data)
@@ -752,9 +888,17 @@ class ReportFrame(tk.Frame):
         self._render_top_bills(data)
 
     def _render_monthly_header(self, data: dict):
-        """Month/Year title"""
-        month = data["month"]
-        year  = data["year"]
+        """Date Range / Month title"""
+        s_date = data.get("start_date")
+        e_date = data.get("end_date")
+        if s_date and e_date:
+            period_title = f"{format_date_display(s_date)} to {format_date_display(e_date)}"
+        elif s_date:
+            period_title = f"From {format_date_display(s_date)}"
+        elif e_date:
+            period_title = f"Up to {format_date_display(e_date)}"
+        else:
+            period_title = f"{MONTH_NAMES[data.get('month', 1)]} {data.get('year', '')}"
 
         hdr = tk.Frame(
             self.content, bg=COLORS["primary"],
@@ -764,8 +908,7 @@ class ReportFrame(tk.Frame):
 
         tk.Label(
             hdr,
-            text=f"📅  Monthly Report — "
-                 f"{MONTH_NAMES[month]} {year}",
+            text=f"📊  Period Report — {period_title}",
             font=FONTS["subheading"],
             bg=COLORS["primary"],
             fg="white"
@@ -775,7 +918,7 @@ class ReportFrame(tk.Frame):
         p_total = data["purchase"].get("total", 0)
         s_total = data["sales"].get("total", 0)
 
-        if p_total == 0:
+        if p_total == 0 and s_total == 0:
             status = "⚠️ No Data"
             sc     = "#f57f17"
         elif s_total == 0:
@@ -794,7 +937,7 @@ class ReportFrame(tk.Frame):
         ).pack(side="right", padx=15)
 
     def _render_summary_cards(self, data: dict):
-        """6 summary stat cards"""
+        """Summary stat cards including active stock on hand"""
         p = data["purchase"]
         s = data["sales"]
 
@@ -822,10 +965,10 @@ class ReportFrame(tk.Frame):
              f"{s.get('bill_count', 0)} bills to "
              f"{s.get('customer_count', 0)} customers",
              "#2e7d32"),
-            ("💰 Gross Profit",
-             format_inr(data["profit"]),
-             f"Margin: {data['margin_pct']:.1f}%",
-             "#e65100"),
+            ("📦 Active Stock on Hand",
+             format_inr(data.get("closing_val", 0)),
+             f"{data.get('closing_units', 0):.1f} units carried forward",
+             "#00695c"),
         ]
 
         for title, value, sub, color in card_defs_r1:
@@ -840,15 +983,14 @@ class ReportFrame(tk.Frame):
         row2.pack(fill="x", pady=(8, 0))
 
         card_defs_r2 = [
-            ("📥 Input GST",
-             format_inr(data["p_gst"]),
-             "GST paid on purchases",
+            ("💰 Gross Profit",
+             format_inr(data["profit"]),
+             f"Margin: {data['margin_pct']:.1f}% on sold goods",
+             "#e65100"),
+            ("📤 GST Balance",
+             f"Out: {format_inr(data['s_gst'])}",
+             f"In: {format_inr(data['p_gst'])}",
              "#4527a0"),
-            ("📤 Output GST",
-             format_inr(data["s_gst"]),
-             f"CGST: {format_inr(data['s_cgst'])}  "
-             f"SGST: {format_inr(data['s_sgst'])}",
-             "#00695c"),
             ("🧾 GST Payable",
              format_inr(data["gst_payable"]),
              "Output GST − Input GST",

@@ -30,6 +30,14 @@ from pathlib import Path
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from collections import defaultdict
+from modules.date_utils import (
+    DATE_PRESETS,
+    get_date_range_for_preset,
+    parse_flexible_date,
+    format_date_display,
+    format_date_iso,
+    get_month_dates,
+)
 
 # ============================================================
 # PATHS
@@ -272,43 +280,94 @@ class BillSplitter:
         self.margin_global = settings["billing"].get(
             "default_margin_global", 15.0
         )
+        self.flat_markup_amount = settings["billing"].get(
+            "flat_markup_amount", 5.0
+        )
+        self.target_profit_amount = settings["billing"].get(
+            "target_profit_amount", 0.0
+        )
         self.tax_scheme   = settings["billing"].get(
             "tax_scheme", "regular"
         )
 
     def get_purchase_pool(
-        self, month: int, year: int
+        self,
+        month: int = None,
+        year: int = None,
+        start_date: date = None,
+        end_date: date = None,
+        include_carried_forward: bool = True,
     ) -> list:
         """
-        Get all purchase items for the month.
-        Only items with remaining_qty > 0.
+        Get all purchase items for the date range.
+        If include_carried_forward is True (default), loads all unsold items
+        purchased on or before end_date (FIFO continuous inventory flow).
         """
-        items = db.query("""
-            SELECT
-                pi.id           AS purchase_item_id,
-                pi.item_name,
-                pi.hsn_code,
-                pi.unit,
-                pi.purchase_rate,
-                pi.gst_rate,
-                pi.quantity     AS original_qty,
-                pi.remaining_qty,
-                pb.bill_month,
-                pb.bill_year,
-                pb.dealer_name
-            FROM purchase_items pi
-            JOIN purchase_bills pb
-                ON pi.purchase_bill_id = pb.id
-            WHERE pb.bill_month = ?
-            AND   pb.bill_year  = ?
-            AND   pi.remaining_qty > 0
-            ORDER BY pi.item_name
-        """, (month, year))
+        if start_date is None or end_date is None:
+            if month is not None and year is not None:
+                start_date, end_date = get_month_dates(year, month)
+            else:
+                today = date.today()
+                start_date, end_date = get_month_dates(today.year, today.month)
+        else:
+            if start_date > end_date:
+                start_date, end_date = end_date, start_date
+
+        start_str = start_date.strftime("%Y-%m-%d")
+        end_str = end_date.strftime("%Y-%m-%d")
+
+        if include_carried_forward:
+            items = db.query("""
+                SELECT
+                    pi.id           AS purchase_item_id,
+                    pi.item_name,
+                    pi.hsn_code,
+                    pi.unit,
+                    pi.purchase_rate,
+                    pi.gst_rate,
+                    pi.quantity     AS original_qty,
+                    pi.remaining_qty,
+                    pb.bill_date,
+                    pb.bill_month,
+                    pb.bill_year,
+                    pb.dealer_name,
+                    CASE WHEN pb.bill_date < ? THEN 1 ELSE 0 END AS is_carried_forward
+                FROM purchase_items pi
+                JOIN purchase_bills pb
+                    ON pi.purchase_bill_id = pb.id
+                WHERE pb.bill_date <= ?
+                AND   pi.remaining_qty > 0.0001
+                ORDER BY pb.bill_date ASC, pi.id ASC
+            """, (start_str, end_str))
+        else:
+            items = db.query("""
+                SELECT
+                    pi.id           AS purchase_item_id,
+                    pi.item_name,
+                    pi.hsn_code,
+                    pi.unit,
+                    pi.purchase_rate,
+                    pi.gst_rate,
+                    pi.quantity     AS original_qty,
+                    pi.remaining_qty,
+                    pb.bill_date,
+                    pb.bill_month,
+                    pb.bill_year,
+                    pb.dealer_name,
+                    0 AS is_carried_forward
+                FROM purchase_items pi
+                JOIN purchase_bills pb
+                    ON pi.purchase_bill_id = pb.id
+                WHERE pb.bill_date >= ?
+                AND   pb.bill_date <= ?
+                AND   pi.remaining_qty > 0.0001
+                ORDER BY pb.bill_date ASC, pi.id ASC
+            """, (start_str, end_str))
 
         return items
 
     def get_margin_for_item(self) -> float:
-        """Get margin % for one item based on settings"""
+        """Get margin value for one item based on settings."""
         if self.margin_type == "global":
             return self.margin_global
         elif self.margin_type == "range":
@@ -318,6 +377,14 @@ class BillSplitter:
                 self.margin_max
             )
             return round(margin, 1)
+        elif self.margin_type == "flat":
+            return max(0.0, float(self.flat_markup_amount or 0.0))
+        elif self.margin_type == "target_profit":
+            if hasattr(self, "_target_margin_pct") and self._target_margin_pct is not None:
+                return self._target_margin_pct
+            if hasattr(self, "_target_multiplier") and self._target_multiplier is not None:
+                return round((self._target_multiplier - 1.0) * 100.0, 1)
+            return 0.0
         else:
             # itemwise — use range as default
             return round(
@@ -327,6 +394,16 @@ class BillSplitter:
                 ), 1
             )
 
+    def get_target_profit_multiplier(self, purchase_total: float) -> float:
+        """Return the sales multiplier required to hit the target profit."""
+        purchase_total = max(0.0, float(purchase_total or 0.0))
+        target_profit = max(0.0, float(self.target_profit_amount or 0.0))
+        if purchase_total <= 0:
+            return 1.0
+        if target_profit <= 0:
+            return 1.0
+        return (purchase_total + target_profit) / purchase_total
+
     def calculate_selling_rate(
         self,
         purchase_rate: float,
@@ -334,27 +411,41 @@ class BillSplitter:
         margin_pct: float
     ) -> tuple:
         """
-        Calculate selling rate for COMPOSITION SCHEME.
+        Calculate selling rate and GST breakdown.
 
-        Formula (Composition / No-GST):
-            selling_rate = purchase_rate + flat_markup
-            (No GST is added on top — shop is on composition scheme)
+        For Regular GST:
+            selling_rate = purchase_rate * (1 + margin_pct / 100)
+            cgst_rate    = gst_rate / 2
+            sgst_rate    = gst_rate / 2
 
-        The flat_markup is stored in settings as
-        billing.flat_markup_amount (default: 5).
+        For Composition (No customer GST charged):
+            selling_rate = purchase_rate * (1 + margin_pct / 100)
+            gst_rate = cgst_rate = sgst_rate = 0.0
+
+        For Flat Markup:
+            selling_rate = purchase_rate + flat_markup_amount
+            GST follows the same scheme logic, but the margin is a rupee amount.
 
         Returns:
             (selling_rate, gst_rate, cgst_rate, sgst_rate)
         """
-        flat_markup = self.settings["billing"].get(
-            "flat_markup_amount", 5.0
-        )
-        selling_rate = round2(purchase_rate + flat_markup)
-        # Composition scheme — no GST charged to customer
-        cgst_rate = 0.0
-        sgst_rate = 0.0
+        if self.margin_type == "flat":
+            flat_markup = max(
+                0.0,
+                float(margin_pct if margin_pct is not None else self.flat_markup_amount or 0.0)
+            )
+            selling_rate = round2(purchase_rate + flat_markup)
+        else:
+            margin = max(0.0, float(margin_pct or 0.0)) / 100.0
+            selling_rate = round2(purchase_rate * (1.0 + margin))
 
-        return selling_rate, 0.0, cgst_rate, sgst_rate
+        if self.tax_scheme == "composition":
+            return selling_rate, 0.0, 0.0, 0.0
+
+        gst_rate = float(gst_rate or 0.0)
+        cgst_rate = round2(gst_rate / 2.0)
+        sgst_rate = round2(gst_rate / 2.0)
+        return selling_rate, gst_rate, cgst_rate, sgst_rate
 
     def _get_working_days(
         self, month: int, year: int
@@ -379,125 +470,89 @@ class BillSplitter:
     def _distribute_dates(
         self,
         n_bills: int,
-        month: int,
-        year: int,
+        month: int = None,
+        year: int = None,
         start_date: date = None,
         end_date: date = None
     ) -> list:
         """
-        Distribute N bill dates across the month naturally.
-
-        If start_date and end_date are provided, choose random dates
-        only from that inclusive range. Otherwise fall back to the
-        natural working-day distribution for the selected month.
+        Distribute N bill dates across the target date range naturally.
+        Prefers working days (Mon-Sat, skipping Sundays).
         """
-        if start_date and end_date:
-            normalized_start = min(start_date, end_date)
-            normalized_end = max(start_date, end_date)
-            start_date = normalized_start
-            end_date = normalized_end
+        if start_date is None or end_date is None:
+            if month is not None and year is not None:
+                start_date, end_date = get_month_dates(year, month)
+            else:
+                today = date.today()
+                start_date, end_date = get_month_dates(today.year, today.month)
 
-            candidate_dates = []
+        if start_date > end_date:
+            start_date, end_date = end_date, start_date
+
+        candidate_dates = []
+        current = start_date
+        while current <= end_date:
+            if current.weekday() != 6:  # Skip Sundays
+                candidate_dates.append(current)
+            current += timedelta(days=1)
+
+        if not candidate_dates:
             current = start_date
             while current <= end_date:
-                if current.year == year and current.month == month:
-                    candidate_dates.append(current)
+                candidate_dates.append(current)
                 current += timedelta(days=1)
 
-            if not candidate_dates:
-                raise ValueError(
-                    "Selected date range does not contain any valid "
-                    f"dates for {MONTH_NAMES[month]} {year}."
-                )
+        if not candidate_dates:
+            return [start_date] * n_bills
 
-            if n_bills <= len(candidate_dates):
-                chosen = sorted(
-                    random.sample(candidate_dates, n_bills)
-                )
-            else:
-                chosen = sorted(
-                    random.choices(candidate_dates, k=n_bills)
-                )
-            return chosen
-
-        working_days = self._get_working_days(month, year)
-
-        if not working_days:
-            # Fallback: first day of month
-            return [date(year, month, 1)] * n_bills
-
-        if n_bills <= len(working_days):
-            # Sample without replacement for natural spread
-            chosen = sorted(
-                random.sample(working_days, n_bills)
-            )
+        if n_bills <= len(candidate_dates):
+            chosen = sorted(random.sample(candidate_dates, n_bills))
         else:
-            # More bills than working days
-            # Allow some days to have multiple bills
-            chosen = sorted(
-                random.choices(working_days, k=n_bills)
-            )
+            chosen = sorted(random.choices(candidate_dates, k=n_bills))
 
         return chosen
 
     def split(
         self,
-        month: int,
-        year: int,
-        n_bills: int,
+        month: int = None,
+        year: int = None,
+        n_bills: int = 5,
         min_items_per_bill: int = 1,
         max_items_per_bill: int = 5,
         override_margin_type: str = None,
         override_margin_min:  float = None,
         override_margin_max:  float = None,
         override_margin_global: float = None,
+        override_flat_markup_amount: float = None,
+        override_target_profit_amount: float = None,
         start_date: date = None,
         end_date: date = None,
+        include_carried_forward: bool = True,
+        allocation_mode: str = "all",
+        target_sales_amount: float = None,
+        stock_percentage: float = 100.0,
+        customer_mode: str = "random",
+        cash_name: str = "Cash Bill",
     ) -> list:
         """
         Main splitting function.
 
         Args:
-            month: Purchase month
-            year:  Purchase year
+            month: Purchase month (optional if start_date/end_date provided)
+            year:  Purchase year (optional if start_date/end_date provided)
             n_bills: Number of sales bills to generate
             min_items_per_bill: Min items per bill
             max_items_per_bill: Max items per bill
             override_*: Override margin settings
+            start_date: Custom range start
+            end_date: Custom range end
+            include_carried_forward: If True, draws from unsold stock before start_date
+            allocation_mode: 'all', 'target_amount', or 'percentage'
+            target_sales_amount: Rupee amount of sales to generate (when allocation_mode='target_amount')
+            stock_percentage: % of stock to sell (when allocation_mode='percentage')
 
         Returns:
             List of bill dicts ready for preview/saving
-            [
-                {
-                    "bill_date": date,
-                    "customer": {...},
-                    "items": [
-                        {
-                            "purchase_item_id": int,
-                            "item_name": str,
-                            "hsn_code": str,
-                            "quantity": float,
-                            "unit": str,
-                            "purchase_rate": float,
-                            "selling_rate": float,
-                            "gst_rate": float,
-                            "cgst_rate": float,
-                            "sgst_rate": float,
-                            "cgst_amount": float,
-                            "sgst_amount": float,
-                            "taxable_amount": float,
-                            "total_amount": float,
-                            "margin_pct": float,
-                        }
-                    ],
-                    "subtotal": float,
-                    "total_cgst": float,
-                    "total_sgst": float,
-                    "grand_total": float,
-                    "bill_type": str,
-                    "margin_avg": float,
-                }
-            ]
         """
         # Apply overrides
         if override_margin_type:
@@ -508,25 +563,112 @@ class BillSplitter:
             self.margin_max = override_margin_max
         if override_margin_global is not None:
             self.margin_global = override_margin_global
+        if override_flat_markup_amount is not None:
+            self.flat_markup_amount = override_flat_markup_amount
+        if override_target_profit_amount is not None:
+            self.target_profit_amount = override_target_profit_amount
 
-        # Step 1: Get purchase pool
-        pool = self.get_purchase_pool(month, year)
+        if start_date is None or end_date is None:
+            if month is not None and year is not None:
+                start_date, end_date = get_month_dates(year, month)
+            else:
+                today = date.today()
+                start_date, end_date = get_month_dates(today.year, today.month)
+
+        if start_date > end_date:
+            start_date, end_date = end_date, start_date
+
+        if month is None:
+            month = start_date.month
+        if year is None:
+            year = start_date.year
+
+        # Step 1: Get purchase pool (including carried forward unsold inventory)
+        pool = self.get_purchase_pool(
+            month=month,
+            year=year,
+            start_date=start_date,
+            end_date=end_date,
+            include_carried_forward=include_carried_forward,
+        )
         if not pool:
             raise ValueError(
-                "No purchase items found for this month.\n"
+                "No purchase items found for this period.\n"
                 "Add purchase bills first."
             )
 
-        # Step 2: Create working copy of pool
-        # (to track remaining quantities)
+        # Step 1b: Determine allocated quantities
         working_pool = []
-        for item in pool:
-            working_pool.append({
-                **item,
-                "remaining": float(item["remaining_qty"])
-            })
+        if allocation_mode == "percentage" and stock_percentage < 99.9:
+            pct = max(1.0, min(100.0, float(stock_percentage))) / 100.0
+            for it in pool:
+                it_copy = dict(it)
+                q_rem = float(it["remaining_qty"])
+                u = it["unit"]
+                alloc_q = self._round_quantity(q_rem * pct, u)
+                alloc_q = max(self._min_qty(u), min(alloc_q, q_rem))
+                it_copy["allocated_qty"] = alloc_q
+                working_pool.append(it_copy)
 
-        # Step 3: Generate bill dates
+        elif allocation_mode == "target_amount" and target_sales_amount and target_sales_amount > 0:
+            target_s = float(target_sales_amount)
+            if self.margin_type == "target_profit" and self.target_profit_amount > 0:
+                est_cost = max(500.0, target_s - self.target_profit_amount)
+            else:
+                est_m = self.margin_global if self.margin_type == "global" else (self.margin_min + self.margin_max) / 2.0
+                est_cost = target_s / (1.0 + max(0.0, est_m) / 100.0)
+
+            accum_cost = 0.0
+            for it in pool:
+                it_copy = dict(it)
+                p_rate = float(it["purchase_rate"])
+                q_rem = float(it["remaining_qty"])
+                it_cost = p_rate * q_rem
+                needed_cost = est_cost - accum_cost
+                if needed_cost <= 0:
+                    break
+                if it_cost <= needed_cost:
+                    it_copy["allocated_qty"] = q_rem
+                    accum_cost += it_cost
+                    working_pool.append(it_copy)
+                else:
+                    needed_q = self._round_quantity(needed_cost / max(p_rate, 0.01), it["unit"])
+                    needed_q = max(self._min_qty(it["unit"]), min(needed_q, q_rem))
+                    it_copy["allocated_qty"] = needed_q
+                    accum_cost += p_rate * needed_q
+                    working_pool.append(it_copy)
+                    break
+            if not working_pool and pool:
+                it_copy = dict(pool[0])
+                it_copy["allocated_qty"] = min(float(pool[0]["remaining_qty"]), self._min_qty(pool[0]["unit"]))
+                working_pool.append(it_copy)
+
+        else:  # allocation_mode == "all"
+            for it in pool:
+                it_copy = dict(it)
+                it_copy["allocated_qty"] = float(it["remaining_qty"])
+                working_pool.append(it_copy)
+
+        total_p_taxable = round2(sum(
+            float(item["purchase_rate"]) * float(item["allocated_qty"])
+            for item in working_pool
+        ))
+
+        # Target profit multiplier and margin %
+        if self.margin_type == "target_profit":
+            self._target_multiplier = self.get_target_profit_multiplier(
+                total_p_taxable
+            )
+            self._target_margin_pct = round(
+                (self.target_profit_amount / total_p_taxable * 100.0)
+                if total_p_taxable > 0 else 0.0,
+                1
+            )
+        else:
+            self._target_multiplier = None
+            self._target_margin_pct = None
+
+        # Step 2: Generate bill dates across target date range
         bill_dates = self._distribute_dates(
             n_bills,
             month,
@@ -535,165 +677,333 @@ class BillSplitter:
             end_date=end_date,
         )
 
-        # Step 4: Get customer names
-        from modules.customer_module import (
-            KarnatakaNameGenerator
-        )
-        name_gen   = KarnatakaNameGenerator()
-        name_gen.refresh_cache(month, year)
-        customers  = name_gen.generate_batch(
-            n_bills, month, year
-        )
+        # Step 3: Get customer names
+        if customer_mode == "cash":
+            resolved_cash_name = (cash_name or "Cash Bill").strip() or "Cash Bill"
+            customers = [resolved_cash_name] * n_bills
+            name_gen = None
+        else:
+            from modules.customer_module import (
+                KarnatakaNameGenerator
+            )
+            name_gen   = KarnatakaNameGenerator()
+            name_gen.refresh_cache(month, year)
+            customers  = name_gen.generate_batch(
+                n_bills, month, year
+            )
 
-        # Step 5: Split items across bills
-        bills = []
+        # Step 4: Distribute pool items across N bills
+        K = len(working_pool)
+        eff_min = max(1, min_items_per_bill)
+        eff_max = max(eff_min, max_items_per_bill, math.ceil(K / max(1, n_bills)) + 3)
 
-        for bill_idx in range(n_bills):
-            # Available items (still have stock)
-            available = [
-                item for item in working_pool
-                if item["remaining"] > 0
-            ]
+        # Determine realistic portions for each item based on volume, rate, and bill count
+        portions = {}
+        for i, item in enumerate(working_pool):
+            q = float(item["allocated_qty"])
+            rate = float(item["purchase_rate"])
+            u = item["unit"].lower()
+            if q <= self._min_qty(item["unit"]) * 1.5 or n_bills <= 1:
+                p = 1
+            elif rate >= 3000:
+                p = max(2, round(q / 5.0))
+            elif "pipe" in item["item_name"].lower() or "cable" in item["item_name"].lower() or u in ("mtr", "mtrs", "meter", "meters"):
+                p = max(2, round(q / 120.0))
+            elif q >= 800:
+                p = max(3, round(q / 200.0))
+            elif q >= 400:
+                p = max(2, round(q / 120.0))
+            elif q >= 150:
+                p = max(2, round(q / 80.0))
+            elif q >= 40:
+                p = max(2, round(q / 35.0))
+            else:
+                p = max(1, round(q / 15.0))
+            portions[i] = max(1, min(n_bills, p))
 
-            if not available:
+        # Respect eff_max total slot capacity across all bills if specified
+        max_total_slots = n_bills * eff_max
+        while sum(portions.values()) > max_total_slots:
+            max_p = max(portions.values())
+            if max_p <= 1:
                 break
+            for i in range(K):
+                if portions[i] == max_p:
+                    portions[i] -= 1
+                    if sum(portions.values()) <= max_total_slots:
+                        break
 
-            # Determine items for this bill
-            is_last_bill = (
-                bill_idx == n_bills - 1 or
-                bill_idx == len(bills)
+        # Generate sub-quantities for each item
+        item_portions = []
+        unit_one_created = False
+
+        for i, item in enumerate(working_pool):
+            p_count = portions[i]
+            q_total = round(float(item["allocated_qty"]), 3)
+            u = item["unit"]
+            u_lower = u.lower()
+
+            is_count_item = u_lower in ("piece", "pieces", "nos", "no", "bottle", "bottles", "set", "sets")
+            make_one = False
+            if not unit_one_created and is_count_item and q_total >= 2.0:
+                make_one = True
+                unit_one_created = True
+
+            if p_count == 1:
+                if make_one and q_total > 1.0 and n_bills > 1:
+                    item_portions.append({"item": item, "quantity": 1.0})
+                    item_portions.append({"item": item, "quantity": round(q_total - 1.0, 3)})
+                else:
+                    item_portions.append({"item": item, "quantity": q_total})
+            else:
+                weights = [random.uniform(0.65, 1.35) for _ in range(p_count)]
+                w_sum = sum(weights)
+                m_q = self._min_qty(u)
+                sub_qtys = []
+                rem = q_total
+
+                if make_one and p_count >= 2:
+                    sub_qtys.append(1.0)
+                    rem = round(rem - 1.0, 3)
+                    weights = weights[1:]
+                    w_sum = sum(weights)
+
+                for w in weights[:-1]:
+                    raw_q = rem * (w / w_sum)
+                    q = self._round_quantity(raw_q, u)
+                    max_allowed = rem - m_q * (p_count - len(sub_qtys) - 1)
+                    if max_allowed >= m_q:
+                        q = max(m_q, min(q, max_allowed))
+                    else:
+                        q = m_q
+                    q = self._round_quantity(q, u)
+                    sub_qtys.append(q)
+                    rem = round(rem - q, 3)
+                sub_qtys.append(round(rem, 3))
+                if sub_qtys[-1] < m_q:
+                    need = m_q - sub_qtys[-1]
+                    max_idx = sub_qtys[:-1].index(max(sub_qtys[:-1]))
+                    sub_qtys[max_idx] = round(sub_qtys[max_idx] - need, 3)
+                    sub_qtys[-1] = m_q
+                for q in sub_qtys:
+                    if q > 0.0001:
+                        item_portions.append({"item": item, "quantity": q})
+
+        # Target budgets for natural ticket sizes (small, medium, large tickets)
+        scales = []
+        for i in range(n_bills):
+            r = i / max(1, n_bills - 1) if n_bills > 1 else 0.5
+            if r < 0.25:
+                scales.append(random.uniform(0.4, 0.65))
+            elif r < 0.7:
+                scales.append(random.uniform(0.85, 1.25))
+            else:
+                scales.append(random.uniform(1.35, 1.8))
+        random.shuffle(scales)
+        s_sum = sum(scales)
+        target_budgets = [(sc / s_sum) * total_p_taxable for sc in scales]
+
+        # Sort portions descending by value
+        item_portions.sort(
+            key=lambda ip: float(ip["item"]["purchase_rate"]) * ip["quantity"],
+            reverse=True
+        )
+
+        bills_raw = [[] for _ in range(n_bills)]
+        bills_ptax = [0.0 for _ in range(n_bills)]
+
+        for ip in item_portions:
+            item_id = ip["item"]["purchase_item_id"]
+            eligible = [
+                b_idx for b_idx in range(n_bills)
+                if all(it["item"]["purchase_item_id"] != item_id for it in bills_raw[b_idx])
+            ]
+            if not eligible:
+                eligible = list(range(n_bills))
+            eligible.sort(
+                key=lambda b_idx: (
+                    len(bills_raw[b_idx]) >= eff_max,
+                    bills_ptax[b_idx] / max(target_budgets[b_idx], 1.0),
+                    len(bills_raw[b_idx]),
+                )
             )
+            chosen_b = eligible[0]
+            bills_raw[chosen_b].append(ip)
+            bills_ptax[chosen_b] += float(ip["item"]["purchase_rate"]) * ip["quantity"]
 
-            bill_items = self._pick_items_for_bill(
-                available=available,
-                working_pool=working_pool,
-                bill_idx=bill_idx,
-                n_bills=n_bills,
-                min_items=min_items_per_bill,
-                max_items=max_items_per_bill,
-                is_last_bill=is_last_bill,
-            )
+        # Ensure no bill is empty
+        for b_idx in range(n_bills):
+            if not bills_raw[b_idx]:
+                rich_b = max(range(n_bills), key=lambda b: len(bills_raw[b]))
+                if len(bills_raw[rich_b]) > 1:
+                    moved = bills_raw[rich_b].pop()
+                    bills_raw[b_idx].append(moved)
 
-            if not bill_items:
+        # Assign selling prices according to margin mode
+        all_lines = []
+        for b_idx in range(n_bills):
+            for ip in bills_raw[b_idx]:
+                p_rate = float(ip["item"]["purchase_rate"])
+                qty = ip["quantity"]
+                ip["purchase_rate"] = p_rate
+                ip["bill_idx"] = b_idx
+
+                if self.margin_type == "target_profit":
+                    target_m = self._target_margin_pct or 0.0
+                    jitter = random.uniform(-0.25, 0.25)
+                    m = max(0.5, target_m + jitter)
+                    sell_rate = round2(p_rate * (1.0 + m / 100.0))
+                elif self.margin_type == "global":
+                    m = self.margin_global
+                    sell_rate = round2(p_rate * (1.0 + m / 100.0))
+                elif self.margin_type == "flat":
+                    margin_val = max(0.0, float(self.flat_markup_amount or 0.0))
+                    sell_rate = round2(p_rate + margin_val)
+                else:  # range and itemwise
+                    m = round(random.uniform(self.margin_min, self.margin_max), 1)
+                    sell_rate = round2(p_rate * (1.0 + m / 100.0))
+                    eff_m = round(((sell_rate - p_rate) / max(p_rate, 0.01)) * 100.0, 1)
+                    while eff_m < self.margin_min:
+                        sell_rate = round2(sell_rate + 0.01)
+                        eff_m = round(((sell_rate - p_rate) / max(p_rate, 0.01)) * 100.0, 1)
+                    while eff_m > self.margin_max:
+                        sell_rate = round2(sell_rate - 0.01)
+                        eff_m = round(((sell_rate - p_rate) / max(p_rate, 0.01)) * 100.0, 1)
+
+                taxable = round2(qty * sell_rate)
+                ip["selling_rate"] = sell_rate
+                ip["taxable_amount"] = taxable
+                all_lines.append(ip)
+
+        # In Target Profit mode: exact balancing down to 0.00 paisa
+        if self.margin_type == "target_profit" and self.target_profit_amount > 0 and all_lines:
+            target_s_taxable = round2(total_p_taxable + self.target_profit_amount)
+            actual_s_taxable = round2(sum(it["taxable_amount"] for it in all_lines))
+            diff = round2(target_s_taxable - actual_s_taxable)
+
+            # Sort lines with smaller quantities first for fine-tuning
+            lines_sorted = sorted(all_lines, key=lambda ip: ip["quantity"])
+
+            for _ in range(5000):
+                if abs(diff) < 0.001:
+                    break
+                step = 0.01 if diff > 0 else -0.01
+                best_cand = None
+                best_rem = abs(diff)
+                for ip in lines_sorted:
+                    new_rate = round2(ip["selling_rate"] + step)
+                    if new_rate <= ip["purchase_rate"]:
+                        continue
+                    new_tax = round2(ip["quantity"] * new_rate)
+                    delta = round2(new_tax - ip["taxable_amount"])
+                    new_diff = round2(diff - delta)
+                    if abs(new_diff) < best_rem:
+                        best_rem = abs(new_diff)
+                        best_cand = (ip, new_rate, new_tax, new_diff)
+                        if abs(new_diff) < 0.001:
+                            break
+                if best_cand:
+                    ip, new_rate, new_tax, new_diff = best_cand
+                    ip["selling_rate"] = new_rate
+                    ip["taxable_amount"] = new_tax
+                    diff = new_diff
+                else:
+                    break
+
+            # If any tiny residual paisa remains (e.g. 0.01), absorb on any unit quantity or single item
+            if abs(diff) > 0.0001:
+                one_items = [ip for ip in all_lines if abs(ip["quantity"] - 1.0) < 0.001]
+                target_ip = one_items[0] if one_items else min(all_lines, key=lambda ip: ip["quantity"])
+                target_ip["selling_rate"] = round2(target_ip["selling_rate"] + diff / target_ip["quantity"])
+                target_ip["taxable_amount"] = round2(target_ip["quantity"] * target_ip["selling_rate"])
+                diff = 0.0
+
+        bills = []
+        for bill_idx in range(n_bills):
+            assigned = bills_raw[bill_idx]
+            if not assigned:
                 continue
 
-            # Calculate totals for this bill
-            subtotal    = 0.0
-            total_cgst  = 0.0
-            total_sgst  = 0.0
-            margins_used = []
+            bill_items = []
+            subtotal = 0.0
+            total_cgst = 0.0
+            total_sgst = 0.0
+            p_bill_total = 0.0
 
-            for bi in bill_items:
-                subtotal   += bi["taxable_amount"]
-                total_cgst += bi["cgst_amount"]
-                total_sgst += bi["sgst_amount"]
-                margins_used.append(bi["margin_pct"])
+            for ip in assigned:
+                p_rate = ip["purchase_rate"]
+                qty = ip["quantity"]
+                sell_rate = ip["selling_rate"]
+                taxable = ip["taxable_amount"]
+                p_bill_total += p_rate * qty
 
-            grand_total = round2(
-                subtotal + total_cgst + total_sgst
-            )
-            avg_margin  = (
-                round(
-                    sum(margins_used) / len(margins_used),
-                    1
+                if self.tax_scheme == "composition":
+                    gst_r = 0.0
+                    cgst_r = 0.0
+                    sgst_r = 0.0
+                else:
+                    gst_r = float(ip["item"]["gst_rate"] or 0.0)
+                    cgst_r = round2(gst_r / 2.0)
+                    sgst_r = round2(gst_r / 2.0)
+
+                cgst = round2(taxable * cgst_r / 100.0)
+                sgst = round2(taxable * sgst_r / 100.0)
+                total = round2(taxable + cgst + sgst)
+
+                subtotal += taxable
+                total_cgst += cgst
+                total_sgst += sgst
+
+                margin = round(((sell_rate - p_rate) / max(p_rate, 0.01)) * 100.0, 1)
+
+                bill_items.append({
+                    "purchase_item_id": ip["item"]["purchase_item_id"],
+                    "item_name": ip["item"]["item_name"],
+                    "hsn_code": ip["item"]["hsn_code"],
+                    "quantity": qty,
+                    "unit": ip["item"]["unit"],
+                    "purchase_rate": p_rate,
+                    "selling_rate": sell_rate,
+                    "gst_rate": gst_r,
+                    "cgst_rate": cgst_r,
+                    "sgst_rate": sgst_r,
+                    "cgst_amount": cgst,
+                    "sgst_amount": sgst,
+                    "taxable_amount": taxable,
+                    "total_amount": total,
+                    "margin_pct": margin,
+                })
+
+            grand_total = round2(subtotal + total_cgst + total_sgst)
+            avg_margin = round((subtotal - p_bill_total) / p_bill_total * 100.0, 1) if p_bill_total > 0 else 0.0
+
+            if customer_mode == "cash":
+                customer_name = (cash_name or "Cash Bill").strip() or "Cash Bill"
+                city = ""
+            else:
+                customer_name = (
+                    customers[bill_idx]
+                    if bill_idx < len(customers)
+                    else name_gen.generate_name(month, year)
                 )
-                if margins_used else 0
-            )
-
-            # Get customer
-            customer_name = (
-                customers[bill_idx]
-                if bill_idx < len(customers)
-                else name_gen.generate_name(month, year)
-            )
-            city = name_gen.get_city()
+                city = name_gen.get_city() if name_gen else ""
 
             bills.append({
-                "bill_date":   bill_dates[bill_idx]
-                               if bill_idx < len(bill_dates)
-                               else date(year, month, 1),
+                "bill_date": bill_dates[bill_idx] if bill_idx < len(bill_dates) else date(year, month, 1),
                 "customer": {
-                    "name":    customer_name,
-                    "city":    city,
-                    "phone":   "",
+                    "name": customer_name,
+                    "city": city,
+                    "phone": "",
                     "address": "",
                 },
-                "items":       bill_items,
-                "subtotal":    round2(subtotal),
-                "total_cgst":  round2(total_cgst),
-                "total_sgst":  round2(total_sgst),
+                "items": bill_items,
+                "subtotal": round2(subtotal),
+                "total_cgst": round2(total_cgst),
+                "total_sgst": round2(total_sgst),
                 "grand_total": grand_total,
-                "bill_type":   self.tax_scheme,
-                "margin_avg":  avg_margin,
+                "bill_type": self.tax_scheme,
+                "margin_avg": avg_margin,
             })
-
-        # Step 6: Handle any remaining stock
-        # Add to last bill as balancing
-        remaining_items = [
-            item for item in working_pool
-            if item["remaining"] > 0.001
-        ]
-
-        if remaining_items and bills:
-            last_bill = bills[-1]
-            for rem_item in remaining_items:
-                if rem_item["remaining"] > 0.001:
-                    margin = self.get_margin_for_item()
-                    sell_rate, gst_r, cgst_r, sgst_r = \
-                        self.calculate_selling_rate(
-                            rem_item["purchase_rate"],
-                            rem_item["gst_rate"],
-                            margin
-                        )
-                    qty     = round(
-                        rem_item["remaining"], 3
-                    )
-                    taxable = round2(qty * sell_rate)
-                    cgst    = round2(taxable * cgst_r / 100)
-                    sgst    = round2(taxable * sgst_r / 100)
-                    total   = round2(taxable + cgst + sgst)
-
-                    last_bill["items"].append({
-                        "purchase_item_id":
-                            rem_item["purchase_item_id"],
-                        "item_name":
-                            rem_item["item_name"],
-                        "hsn_code":
-                            rem_item["hsn_code"],
-                        "quantity":    qty,
-                        "unit":        rem_item["unit"],
-                        "purchase_rate":
-                            rem_item["purchase_rate"],
-                        "selling_rate": sell_rate,
-                        "gst_rate":    gst_r,
-                        "cgst_rate":   cgst_r,
-                        "sgst_rate":   sgst_r,
-                        "cgst_amount": cgst,
-                        "sgst_amount": sgst,
-                        "taxable_amount": taxable,
-                        "total_amount": total,
-                        "margin_pct":  margin,
-                    })
-                    rem_item["remaining"] = 0
-
-            # Recalculate last bill totals
-            last_bill["subtotal"]    = round2(sum(
-                i["taxable_amount"]
-                for i in last_bill["items"]
-            ))
-            last_bill["total_cgst"]  = round2(sum(
-                i["cgst_amount"]
-                for i in last_bill["items"]
-            ))
-            last_bill["total_sgst"]  = round2(sum(
-                i["sgst_amount"]
-                for i in last_bill["items"]
-            ))
-            last_bill["grand_total"] = round2(
-                last_bill["subtotal"] +
-                last_bill["total_cgst"] +
-                last_bill["total_sgst"]
-            )
 
         return bills
 
@@ -706,6 +1016,7 @@ class BillSplitter:
         min_items:   int,
         max_items:   int,
         is_last_bill: bool,
+        sell_multiplier: float = None,
     ) -> list:
         """
         Pick items and quantities for one sales bill.
@@ -723,13 +1034,25 @@ class BillSplitter:
             # Last bill — take ALL remaining
             for item in working_pool:
                 if item["remaining"] > 0.001:
-                    margin    = self.get_margin_for_item()
-                    sell_rate, gst_r, cgst_r, sgst_r = \
-                        self.calculate_selling_rate(
-                            item["purchase_rate"],
-                            item["gst_rate"],
-                            margin
+                    if self.margin_type == "target_profit":
+                        multiplier = sell_multiplier or getattr(self, "_target_multiplier", None) or 1.0
+                        sell_rate = round2(item["purchase_rate"] * multiplier)
+                        margin = round(
+                            ((sell_rate - item["purchase_rate"]) /
+                             max(item["purchase_rate"], 0.01)) * 100,
+                            1,
                         )
+                        gst_r = float(item["gst_rate"] or 0.0)
+                        cgst_r = round2(gst_r / 2.0)
+                        sgst_r = round2(gst_r / 2.0)
+                    else:
+                        margin    = self.get_margin_for_item()
+                        sell_rate, gst_r, cgst_r, sgst_r = \
+                            self.calculate_selling_rate(
+                                item["purchase_rate"],
+                                item["gst_rate"],
+                                margin
+                            )
                     qty     = round(item["remaining"], 3)
                     taxable = round2(qty * sell_rate)
                     cgst    = round2(
@@ -772,9 +1095,9 @@ class BillSplitter:
         )
 
         # Shuffle and pick n_items
-        shuffled = available.copy()
-        random.shuffle(shuffled)
-        chosen_items = shuffled[:n_items]
+        candidate_count = min(len(available), max(n_items * 2, 6))
+        candidates = available[:candidate_count]
+        chosen_items = random.sample(candidates, min(n_items, len(candidates)))
 
         # Bills remaining after this one
         bills_left = n_bills - bill_idx
@@ -783,42 +1106,46 @@ class BillSplitter:
             if item["remaining"] < 0.001:
                 continue
 
-            # What fraction of remaining to use?
-            # Strategy: if many bills left, use smaller portion
-            # If few bills left, use more
-            if bills_left <= 1:
-                fraction = 1.0
-            elif bills_left <= 3:
-                # Use 30-70% of remaining
-                fraction = random.uniform(0.3, 0.7)
+            min_q = self._min_qty(item["unit"])
+
+            # If remaining stock is small or few bills left, finish the item
+            if bills_left <= 2 or item["remaining"] <= min_q * 2 or (
+                item["remaining"] <= item["original_qty"] * 0.35 and random.random() < 0.4
+            ):
+                qty = round(item["remaining"], 3)
             else:
-                # Use 10-40% of remaining
-                fraction = random.uniform(0.1, 0.4)
-
-            raw_qty = item["remaining"] * fraction
-
-            # Round quantity to realistic values
-            qty = self._round_quantity(
-                raw_qty, item["unit"]
-            )
-
-            # Ensure at least minimum meaningful quantity
-            qty = max(qty, self._min_qty(item["unit"]))
-
-            # Ensure not exceeding remaining
-            qty = min(qty, item["remaining"])
+                fraction = random.uniform(0.25, 0.60)
+                raw_qty = item["remaining"] * fraction
+                qty = self._round_quantity(
+                    raw_qty, item["unit"]
+                )
+                qty = max(qty, min_q)
+                qty = min(qty, item["remaining"])
+                if item["remaining"] - qty < min_q:
+                    qty = round(item["remaining"], 3)
 
             if qty < 0.001:
                 continue
 
             # Calculate prices
-            margin    = self.get_margin_for_item()
-            sell_rate, gst_r, cgst_r, sgst_r = \
-                self.calculate_selling_rate(
-                    item["purchase_rate"],
-                    item["gst_rate"],
-                    margin
+            if self.margin_type == "target_profit" and sell_multiplier is not None:
+                sell_rate = round2(item["purchase_rate"] * sell_multiplier)
+                margin = round(
+                    ((sell_rate - item["purchase_rate"]) /
+                     max(item["purchase_rate"], 0.01)) * 100,
+                    1,
                 )
+                gst_r = float(item["gst_rate"] or 0.0)
+                cgst_r = round2(gst_r / 2.0)
+                sgst_r = round2(gst_r / 2.0)
+            else:
+                margin    = self.get_margin_for_item()
+                sell_rate, gst_r, cgst_r, sgst_r = \
+                    self.calculate_selling_rate(
+                        item["purchase_rate"],
+                        item["gst_rate"],
+                        margin
+                    )
 
             taxable = round2(qty * sell_rate)
             cgst    = round2(taxable * cgst_r / 100)
@@ -858,120 +1185,125 @@ class BillSplitter:
         """
         unit_lower = unit.lower()
 
-        if unit_lower in ("piece", "pcs", "nos"):
-            # Round to whole numbers
-            return max(1, round(qty))
+        if unit_lower in (
+            "piece", "pieces", "pcs", "pc", "nos", "no",
+            "bottle", "bottles", "can", "cans", "box", "boxes",
+            "bag", "bags", "set", "sets", "pkt", "packet", "packets",
+            "roll", "rolls", "drum", "drums", "bundle", "bundles"
+        ):
+            # Whole units for count items
+            return float(max(1, round(qty)))
 
-        elif unit_lower in ("kg", "kilogram"):
+        elif unit_lower in ("meter", "meters", "metre", "metres", "mtr", "mtrs"):
+            # Whole integer meters for pipes and cables >= 10m
             if qty >= 10:
-                return round(qty / 5) * 5  # nearest 5kg
+                return float(round(qty))
             elif qty >= 1:
-                return round(qty, 1)  # 1 decimal
+                return float(round(qty, 1))
             else:
-                return round(qty, 2)
+                return float(round(qty, 2))
 
-        elif unit_lower in ("meter", "metre", "mtr"):
+        elif unit_lower in ("kg", "kilogram", "kgs", "kilograms"):
+            if qty >= 20:
+                return float(round(qty))
+            elif qty >= 1:
+                return float(round(qty, 1))
+            else:
+                return float(round(qty, 2))
+
+        elif unit_lower in ("liter", "litre", "ltr", "liters", "litres", "ltrs"):
             if qty >= 10:
-                return round(qty / 2) * 2  # nearest 2m
+                return float(round(qty))
             elif qty >= 1:
-                return round(qty, 1)
+                return float(round(qty, 1))
             else:
-                return round(qty, 2)
-
-        elif unit_lower in ("liter", "litre", "ltr"):
-            if qty >= 5:
-                return round(qty / 5) * 5  # nearest 5L
-            elif qty >= 1:
-                return round(qty, 1)
-            else:
-                return round(qty, 2)
-
-        elif unit_lower in ("bag", "bags"):
-            return max(1, round(qty))
+                return float(round(qty, 2))
 
         else:
-            # Default: 2 decimal places
-            return round(qty, 2)
+            return float(round(qty, 2))
 
     def _min_qty(self, unit: str) -> float:
         """Minimum meaningful quantity per unit"""
         unit_lower = unit.lower()
-        mins = {
-            "piece": 1.0, "pcs": 1.0, "nos": 1.0,
-            "kg": 0.5,    "kilogram": 0.5,
-            "meter": 0.5, "metre": 0.5,  "mtr": 0.5,
-            "liter": 0.5, "litre": 0.5,  "ltr": 0.5,
-            "bag":   1.0, "bags": 1.0,
-        }
-        return mins.get(unit_lower, 1.0)
+        if unit_lower in (
+            "piece", "pieces", "pcs", "pc", "nos", "no",
+            "bottle", "bottles", "can", "cans", "box", "boxes",
+            "bag", "bags", "set", "sets", "pkt", "packet", "packets",
+            "roll", "rolls", "drum", "drums", "bundle", "bundles"
+        ):
+            return 1.0
+        elif unit_lower in ("meter", "meters", "metre", "metres", "mtr", "mtrs"):
+            return 1.0
+        elif unit_lower in ("kg", "kilogram", "kgs", "kilograms"):
+            return 0.5
+        elif unit_lower in ("liter", "litre", "ltr", "liters", "litres", "ltrs"):
+            return 0.5
+        return 1.0
 
     def verify_tally(
         self,
-        month: int,
-        year: int,
-        generated_bills: list
+        month: int = None,
+        year: int = None,
+        generated_bills: list = None,
+        start_date: date = None,
+        end_date: date = None,
+        pool: list = None,
     ) -> dict:
         """
-        Verify that generated bills account for
-        all purchased items.
-
-        Returns tally report dict.
+        Verify that generated bills account for purchased items.
+        Supports continuous inventory carry-forward and custom date ranges.
         """
-        # Purchase totals
-        p = db.query_one("""
-            SELECT
-                COALESCE(SUM(subtotal),    0) AS p_taxable,
-                COALESCE(SUM(total_gst),   0) AS p_gst,
-                COALESCE(SUM(grand_total), 0) AS p_total
-            FROM purchase_bills
-            WHERE bill_month=? AND bill_year=?
-        """, (month, year))
+        generated_bills = generated_bills or []
+        if start_date is None or end_date is None:
+            if month is not None and year is not None:
+                start_date, end_date = get_month_dates(year, month)
+            else:
+                today = date.today()
+                start_date, end_date = get_month_dates(today.year, today.month)
 
         # Generated bills totals
-        s_taxable  = sum(
-            b["subtotal"] for b in generated_bills
-        )
-        s_cgst     = sum(
-            b["total_cgst"] for b in generated_bills
-        )
-        s_sgst     = sum(
-            b["total_sgst"] for b in generated_bills
-        )
-        s_total    = sum(
-            b["grand_total"] for b in generated_bills
-        )
-        s_gst      = s_cgst + s_sgst
+        s_taxable = round2(sum(b["subtotal"] for b in generated_bills))
+        s_cgst    = round2(sum(b["total_cgst"] for b in generated_bills))
+        s_sgst    = round2(sum(b["total_sgst"] for b in generated_bills))
+        s_total   = round2(sum(b["grand_total"] for b in generated_bills))
+        s_gst     = round2(s_cgst + s_sgst)
+
+        batch_p_taxable = round2(sum(
+            float(it["purchase_rate"]) * float(it["quantity"])
+            for bill in generated_bills
+            for it in bill["items"]
+        ))
+        batch_p_gst = round2(sum(
+            float(it["purchase_rate"]) * float(it["quantity"]) * float(it.get("gst_rate", 0)) / 100.0
+            for bill in generated_bills
+            for it in bill["items"]
+        ))
 
         # Item tally
-        purchase_items = db.query("""
-            SELECT
-                pi.item_name,
-                pi.unit,
-                SUM(pi.quantity) AS total_purchased
-            FROM purchase_items pi
-            JOIN purchase_bills pb
-                ON pi.purchase_bill_id = pb.id
-            WHERE pb.bill_month=? AND pb.bill_year=?
-            GROUP BY pi.item_name, pi.unit
-        """, (month, year))
-
-        # Count items in generated bills
         item_totals = defaultdict(float)
         for bill in generated_bills:
             for item in bill["items"]:
                 key = item["item_name"].lower()
-                item_totals[key] += item["quantity"]
+                item_totals[key] += float(item["quantity"])
 
-        # Compare
+        if pool is None:
+            pool = self.get_purchase_pool(
+                month=month,
+                year=year,
+                start_date=start_date,
+                end_date=end_date,
+                include_carried_forward=True,
+            )
+
         item_tally = []
         all_tallied = True
 
-        for pi in purchase_items:
+        for pi in pool:
             key       = pi["item_name"].lower()
-            purchased = pi["total_purchased"]
-            sold      = item_totals.get(key, 0)
-            diff      = round(purchased - sold, 3)
-            ok        = abs(diff) < 0.01
+            available = float(pi["remaining_qty"])
+            sold      = round(item_totals.get(key, 0.0), 3)
+            diff      = round(available - sold, 3)
+            ok        = (sold <= available + 0.01) and (diff >= -0.01)
 
             if not ok:
                 all_tallied = False
@@ -979,28 +1311,24 @@ class BillSplitter:
             item_tally.append({
                 "item_name": pi["item_name"],
                 "unit":      pi["unit"],
-                "purchased": purchased,
-                "sold":      round(sold, 3),
+                "purchased": available,
+                "sold":      sold,
                 "diff":      diff,
                 "ok":        ok,
             })
 
-        profit     = round2(
-            s_taxable - p["p_taxable"]
-        )
-        gst_payable = round2(
-            max(0, s_gst - p["p_gst"])
-        )
+        profit = round2(s_taxable - batch_p_taxable)
+        gst_payable = round2(max(0.0, s_gst - batch_p_gst))
 
         return {
-            "purchase_taxable": p["p_taxable"],
-            "purchase_gst":     p["p_gst"],
-            "purchase_total":   p["p_total"],
-            "sales_taxable":    round2(s_taxable),
-            "sales_gst":        round2(s_gst),
-            "sales_cgst":       round2(s_cgst),
-            "sales_sgst":       round2(s_sgst),
-            "sales_total":      round2(s_total),
+            "purchase_taxable": batch_p_taxable,
+            "purchase_gst":     batch_p_gst,
+            "purchase_total":   round2(batch_p_taxable + batch_p_gst),
+            "sales_taxable":    s_taxable,
+            "sales_gst":        s_gst,
+            "sales_cgst":       s_cgst,
+            "sales_sgst":       s_sgst,
+            "sales_total":      s_total,
             "profit":           profit,
             "gst_payable":      gst_payable,
             "all_items_tallied": all_tallied,
@@ -1709,15 +2037,26 @@ class SalesFrame(tk.Frame):
         self.settings = load_settings()
 
         today = date.today()
+        self.var_date_preset = tk.StringVar(value="This Month")
+        first_d, last_d = get_date_range_for_preset("This Month")
+        self.var_filter_from = tk.StringVar(value=format_date_display(first_d))
+        self.var_filter_to = tk.StringVar(value=format_date_display(last_d))
+
         self.filter_month = tk.IntVar(value=today.month)
         self.filter_year  = tk.IntVar(value=today.year)
-        self.var_start_date = tk.StringVar()
-        self.var_end_date = tk.StringVar()
+        self.var_start_date = tk.StringVar(value=format_date_display(first_d))
+        self.var_end_date = tk.StringVar(value=format_date_display(last_d))
+
+        # Carry-forward & stock allocation controls
+        self.var_include_carried_forward = tk.BooleanVar(value=True)
+        self.var_allocation_mode = tk.StringVar(value="all")  # "all", "target_amount", "percentage"
+        self.var_target_sales_amount = tk.DoubleVar(value=100000.0)
+        self.var_stock_percentage = tk.DoubleVar(value=50.0)
 
         # Split configuration vars
         self.var_n_bills      = tk.IntVar(value=10)
-        self.var_min_items    = tk.IntVar(value=1)
-        self.var_max_items    = tk.IntVar(value=5)
+        self.var_min_items    = tk.IntVar(value=2)
+        self.var_max_items    = tk.IntVar(value=8)
         self.var_margin_type  = tk.StringVar(
             value=self.settings["billing"].get(
                 "default_margin_type", "range"
@@ -1738,11 +2077,23 @@ class SalesFrame(tk.Frame):
                 "default_margin_global", 15.0
             )
         )
+        self.var_flat_markup_amount = tk.DoubleVar(
+            value=self.settings["billing"].get(
+                "flat_markup_amount", 5.0
+            )
+        )
+        self.var_target_profit_amount = tk.DoubleVar(
+            value=self.settings["billing"].get(
+                "target_profit_amount", 0.0
+            )
+        )
         self.var_bill_type = tk.StringVar(
             value=self.settings["billing"].get(
                 "tax_scheme", "regular"
             )
         )
+        self.var_customer_mode = tk.StringVar(value="random")  # "random" or "cash"
+        self.var_cash_name     = tk.StringVar(value="Cash Bill")
 
         # Pending generated bills (not yet saved)
         self.pending_bills = []
@@ -1803,6 +2154,14 @@ class SalesFrame(tk.Frame):
                 int(-1 * (e.delta / 120)), "units"
             )
         )
+        canvas.bind_all(
+            "<Button-4>",
+            lambda e: canvas.yview_scroll(-1, "units")
+        )
+        canvas.bind_all(
+            "<Button-5>",
+            lambda e: canvas.yview_scroll(1, "units")
+        )
 
         # Two column layout
         cols = tk.Frame(
@@ -1819,7 +2178,6 @@ class SalesFrame(tk.Frame):
             width=420
         )
         left.pack(side="left", fill="y", padx=(0, 10))
-        left.pack_propagate(False)
         self._build_generate_panel(left)
 
         # Right — existing bills
@@ -1841,58 +2199,98 @@ class SalesFrame(tk.Frame):
             fg=COLORS["text_dark"]
         ).pack(side="left")
 
-        # Right — filter
+        # Right — Date filter controls
         right = tk.Frame(top, bg=COLORS["bg_main"])
         right.pack(side="right")
 
         tk.Label(
             right,
-            text="Month:",
+            text="Preset:",
             font=FONTS["label_bold"],
             bg=COLORS["bg_main"],
             fg=COLORS["text_dark"]
-        ).pack(side="left", padx=(0, 5))
+        ).pack(side="left", padx=(0, 4))
 
-        month_cb = ttk.Combobox(
+        preset_cb = ttk.Combobox(
             right,
-            values=MONTH_NAMES[1:],
+            values=DATE_PRESETS,
+            textvariable=self.var_date_preset,
+            width=17,
+            font=FONTS["body"],
+            state="readonly"
+        )
+        preset_cb.pack(side="left", padx=3)
+        preset_cb.bind("<<ComboboxSelected>>", lambda e: self._on_preset_change())
+
+        tk.Label(
+            right,
+            text="From:",
+            font=FONTS["small"],
+            bg=COLORS["bg_main"],
+            fg=COLORS["text_dark"]
+        ).pack(side="left", padx=(8, 2))
+
+        tk.Entry(
+            right,
+            textvariable=self.var_filter_from,
+            font=FONTS["body"],
             width=11,
-            font=FONTS["body"],
-            state="readonly"
-        )
-        month_cb.set(
-            MONTH_NAMES[self.filter_month.get()]
-        )
-        month_cb.pack(side="left", padx=3)
-        month_cb.bind(
-            "<<ComboboxSelected>>",
-            lambda e: self._on_filter_change(
-                month_cb.get(), None
-            )
-        )
+            relief="solid", bd=1
+        ).pack(side="left", padx=2)
 
-        current_year = date.today().year
-        year_cb = ttk.Combobox(
+        tk.Label(
             right,
-            values=[str(y) for y in range(
-                current_year - 3,
-                current_year + 2
-            )],
-            width=7,
-            font=FONTS["body"],
-            state="readonly"
-        )
-        year_cb.set(str(self.filter_year.get()))
-        year_cb.pack(side="left", padx=3)
-        year_cb.bind(
-            "<<ComboboxSelected>>",
-            lambda e: self._on_filter_change(
-                None, year_cb.get()
-            )
-        )
+            text="To:",
+            font=FONTS["small"],
+            bg=COLORS["bg_main"],
+            fg=COLORS["text_dark"]
+        ).pack(side="left", padx=(6, 2))
 
-        self.month_cb = month_cb
-        self.year_cb  = year_cb
+        tk.Entry(
+            right,
+            textvariable=self.var_filter_to,
+            font=FONTS["body"],
+            width=11,
+            relief="solid", bd=1
+        ).pack(side="left", padx=2)
+
+        tk.Button(
+            right,
+            text="🔍 Apply",
+            font=FONTS["small"],
+            bg=COLORS["primary_light"],
+            fg="white",
+            relief="flat",
+            padx=10, pady=3,
+            cursor="hand2",
+            command=self._apply_custom_filter
+        ).pack(side="left", padx=(8, 0))
+
+    def _on_preset_change(self):
+        preset = self.var_date_preset.get()
+        if preset != "Custom Range":
+            s_date, e_date = get_date_range_for_preset(preset)
+            self.var_filter_from.set(format_date_display(s_date))
+            self.var_filter_to.set(format_date_display(e_date))
+            self.var_start_date.set(format_date_display(s_date))
+            self.var_end_date.set(format_date_display(e_date))
+            self.filter_month.set(s_date.month)
+            self.filter_year.set(s_date.year)
+        self._load_data()
+
+    def _apply_custom_filter(self):
+        s_date = parse_flexible_date(self.var_filter_from.get())
+        e_date = parse_flexible_date(self.var_filter_to.get())
+        if s_date and e_date:
+            if s_date > e_date:
+                s_date, e_date = e_date, s_date
+                self.var_filter_from.set(format_date_display(s_date))
+                self.var_filter_to.set(format_date_display(e_date))
+            self.var_start_date.set(format_date_display(s_date))
+            self.var_end_date.set(format_date_display(e_date))
+            self.filter_month.set(s_date.month)
+            self.filter_year.set(s_date.year)
+        self._load_data()
 
     def _on_filter_change(self, month_name, year_str):
         if month_name:
@@ -1905,17 +2303,10 @@ class SalesFrame(tk.Frame):
         self._load_data()
 
     def _refresh_date_range_defaults(self):
-        """Reset the generated-sales date range to the selected month."""
-        month = self.filter_month.get()
-        year = self.filter_year.get()
-        first_day = date(year, month, 1)
-        last_day = date(year, month, calendar.monthrange(year, month)[1])
-        if not self.var_start_date.get():
-            self.var_start_date.set(first_day.strftime("%d-%m-%Y"))
-        if not self.var_end_date.get():
-            self.var_end_date.set(last_day.strftime("%d-%m-%Y"))
-        self.var_start_date.set(first_day.strftime("%d-%m-%Y"))
-        self.var_end_date.set(last_day.strftime("%d-%m-%Y"))
+        """Reset the generated-sales date range to the current preset or month."""
+        s_date, e_date = get_date_range_for_preset(self.var_date_preset.get())
+        self.var_start_date.set(format_date_display(s_date))
+        self.var_end_date.set(format_date_display(e_date))
 
     # ----------------------------------------------------------
     # GENERATE PANEL
@@ -1927,17 +2318,18 @@ class SalesFrame(tk.Frame):
         pool_card = tk.Frame(
             parent,
             bg=COLORS["bg_card"],
-            padx=15, pady=12
+            padx=12, pady=8
         )
-        pool_card.pack(fill="x", pady=(0, 8))
+        pool_card.pack(fill="x", pady=(0, 6))
 
-        tk.Label(
+        self.pool_title_lbl = tk.Label(
             pool_card,
-            text="📦 Purchase Pool (This Month)",
+            text="📦 Stock Inventory Pool",
             font=FONTS["subheading"],
             bg=COLORS["bg_card"],
             fg=COLORS["text_dark"]
-        ).pack(anchor="w", pady=(0, 5))
+        )
+        self.pool_title_lbl.pack(anchor="w", pady=(0, 4))
 
         self.pool_info_frame = tk.Frame(
             pool_card, bg=COLORS["bg_card"]
@@ -1948,9 +2340,9 @@ class SalesFrame(tk.Frame):
         config_card = tk.Frame(
             parent,
             bg=COLORS["bg_card"],
-            padx=15, pady=12
+            padx=12, pady=8
         )
-        config_card.pack(fill="x", pady=(0, 8))
+        config_card.pack(fill="x", pady=(0, 6))
 
         tk.Label(
             config_card,
@@ -1958,13 +2350,13 @@ class SalesFrame(tk.Frame):
             font=FONTS["subheading"],
             bg=COLORS["bg_card"],
             fg=COLORS["text_dark"]
-        ).pack(anchor="w", pady=(0, 10))
+        ).pack(anchor="w", pady=(0, 6))
 
         # Number of bills
         row1 = tk.Frame(
             config_card, bg=COLORS["bg_card"]
         )
-        row1.pack(fill="x", pady=4)
+        row1.pack(fill="x", pady=2)
 
         tk.Label(
             row1,
@@ -1972,7 +2364,7 @@ class SalesFrame(tk.Frame):
             font=FONTS["label_bold"],
             bg=COLORS["bg_card"],
             fg=COLORS["text_dark"],
-            width=25,
+            width=24,
             anchor="w"
         ).pack(side="left")
 
@@ -1989,7 +2381,7 @@ class SalesFrame(tk.Frame):
         row2 = tk.Frame(
             config_card, bg=COLORS["bg_card"]
         )
-        row2.pack(fill="x", pady=4)
+        row2.pack(fill="x", pady=2)
 
         tk.Label(
             row2,
@@ -1997,7 +2389,7 @@ class SalesFrame(tk.Frame):
             font=FONTS["label_bold"],
             bg=COLORS["bg_card"],
             fg=COLORS["text_dark"],
-            width=25, anchor="w"
+            width=24, anchor="w"
         ).pack(side="left")
 
         tk.Spinbox(
@@ -2030,7 +2422,7 @@ class SalesFrame(tk.Frame):
         row3 = tk.Frame(
             config_card, bg=COLORS["bg_card"]
         )
-        row3.pack(fill="x", pady=4)
+        row3.pack(fill="x", pady=2)
 
         tk.Label(
             row3,
@@ -2038,7 +2430,7 @@ class SalesFrame(tk.Frame):
             font=FONTS["label_bold"],
             bg=COLORS["bg_card"],
             fg=COLORS["text_dark"],
-            width=25, anchor="w"
+            width=24, anchor="w"
         ).pack(side="left")
 
         for val, lbl in [
@@ -2055,13 +2447,73 @@ class SalesFrame(tk.Frame):
                 activebackground=COLORS["bg_card"]
             ).pack(side="left", padx=(0, 10))
 
+        # Customer Naming (Random Names vs Cash Bills)
+        cust_frame = tk.Frame(
+            config_card,
+            bg="#fdf8f0",
+            padx=8, pady=5
+        )
+        cust_frame.pack(fill="x", pady=(0, 5))
+
+        tk.Label(
+            cust_frame,
+            text="👤 Customer Naming",
+            font=FONTS["label_bold"],
+            bg="#fdf8f0",
+            fg=COLORS["text_dark"]
+        ).pack(anchor="w", pady=(0, 2))
+
+        cust_row = tk.Frame(cust_frame, bg="#fdf8f0")
+        cust_row.pack(fill="x", pady=1)
+
+        tk.Radiobutton(
+            cust_row,
+            text="Random Names",
+            variable=self.var_customer_mode,
+            value="random",
+            font=FONTS["small"],
+            bg="#fdf8f0",
+            activebackground="#fdf8f0",
+            command=self._on_customer_mode_change
+        ).pack(side="left", padx=(0, 8))
+
+        tk.Radiobutton(
+            cust_row,
+            text="Cash Bills",
+            variable=self.var_customer_mode,
+            value="cash",
+            font=FONTS["small"],
+            bg="#fdf8f0",
+            activebackground="#fdf8f0",
+            command=self._on_customer_mode_change
+        ).pack(side="left", padx=(0, 6))
+
+        self.cash_name_label = tk.Label(
+            cust_row,
+            text="Name:",
+            font=FONTS["small"],
+            bg="#fdf8f0",
+            fg=COLORS["text_muted"]
+        )
+        self.cash_name_label.pack(side="left", padx=(6, 2))
+
+        self.cash_name_ent = tk.Entry(
+            cust_row,
+            textvariable=self.var_cash_name,
+            font=FONTS["body"],
+            width=11,
+            relief="solid", bd=1,
+            state="disabled"
+        )
+        self.cash_name_ent.pack(side="left")
+
         # Date range for generated sales bills
         date_range_frame = tk.Frame(
             config_card,
             bg="#eef8ff",
-            padx=10, pady=8
+            padx=8, pady=5
         )
-        date_range_frame.pack(fill="x", pady=(0, 8))
+        date_range_frame.pack(fill="x", pady=(0, 5))
 
         tk.Label(
             date_range_frame,
@@ -2069,19 +2521,10 @@ class SalesFrame(tk.Frame):
             font=FONTS["label_bold"],
             bg="#eef8ff",
             fg=COLORS["primary"]
-        ).pack(anchor="w", pady=(0, 6))
-
-        month = self.filter_month.get()
-        year = self.filter_year.get()
-        self.var_start_date.set(
-            date(year, month, 1).strftime("%d-%m-%Y")
-        )
-        self.var_end_date.set(
-            date(year, month, calendar.monthrange(year, month)[1]).strftime("%d-%m-%Y")
-        )
+        ).pack(anchor="w", pady=(0, 3))
 
         date_row = tk.Frame(date_range_frame, bg="#eef8ff")
-        date_row.pack(fill="x", pady=2)
+        date_row.pack(fill="x", pady=1)
 
         tk.Label(
             date_row,
@@ -2095,9 +2538,9 @@ class SalesFrame(tk.Frame):
             date_row,
             textvariable=self.var_start_date,
             font=FONTS["body"],
-            width=12,
+            width=11,
             relief="solid", bd=1
-        ).pack(side="left", padx=(5, 12))
+        ).pack(side="left", padx=(5, 10))
 
         tk.Label(
             date_row,
@@ -2111,17 +2554,95 @@ class SalesFrame(tk.Frame):
             date_row,
             textvariable=self.var_end_date,
             font=FONTS["body"],
-            width=12,
+            width=11,
             relief="solid", bd=1
         ).pack(side="left", padx=(5, 0))
+
+        # Stock Allocation & Carry Forward
+        alloc_frame = tk.Frame(
+            config_card,
+            bg="#f0fff4",
+            padx=8, pady=5
+        )
+        alloc_frame.pack(fill="x", pady=(0, 5))
+
+        tk.Label(
+            alloc_frame,
+            text="📦 Stock Allocation",
+            font=FONTS["label_bold"],
+            bg="#f0fff4",
+            fg=COLORS["success"]
+        ).pack(anchor="w", pady=(0, 2))
+
+        tk.Checkbutton(
+            alloc_frame,
+            text="Include Unsold Stock from earlier purchases",
+            variable=self.var_include_carried_forward,
+            font=FONTS["small"],
+            bg="#f0fff4",
+            activebackground="#f0fff4",
+        ).pack(anchor="w", pady=(0, 2))
+
+        alloc_row = tk.Frame(alloc_frame, bg="#f0fff4")
+        alloc_row.pack(fill="x", pady=1)
+
+        for val, lbl in [
+            ("all", "All Stock"),
+            ("target_amount", "Target Rupee ₹"),
+            ("percentage", "Stock %"),
+        ]:
+            tk.Radiobutton(
+                alloc_row,
+                text=lbl,
+                variable=self.var_allocation_mode,
+                value=val,
+                font=FONTS["small"],
+                bg="#f0fff4",
+                activebackground="#f0fff4",
+                command=self._on_allocation_mode_change
+            ).pack(side="left", padx=(0, 6))
+
+        self.alloc_target_frame = tk.Frame(alloc_frame, bg="#f0fff4")
+        tk.Label(
+            self.alloc_target_frame,
+            text="Target Sales Amount ₹:",
+            font=FONTS["small"],
+            bg="#f0fff4",
+            fg=COLORS["text_dark"]
+        ).pack(side="left")
+        tk.Entry(
+            self.alloc_target_frame,
+            textvariable=self.var_target_sales_amount,
+            font=FONTS["body"],
+            width=10,
+            relief="solid", bd=1
+        ).pack(side="left", padx=5)
+
+        self.alloc_pct_frame = tk.Frame(alloc_frame, bg="#f0fff4")
+        tk.Label(
+            self.alloc_pct_frame,
+            text="Sell Stock %:",
+            font=FONTS["small"],
+            bg="#f0fff4",
+            fg=COLORS["text_dark"]
+        ).pack(side="left")
+        tk.Entry(
+            self.alloc_pct_frame,
+            textvariable=self.var_stock_percentage,
+            font=FONTS["body"],
+            width=5,
+            relief="solid", bd=1
+        ).pack(side="left", padx=5)
+
+        self._on_allocation_mode_change()
 
         # Margin settings
         margin_frame = tk.Frame(
             config_card,
             bg="#f0f4ff",
-            padx=10, pady=8
+            padx=8, pady=5
         )
-        margin_frame.pack(fill="x", pady=8)
+        margin_frame.pack(fill="x", pady=4)
 
         tk.Label(
             margin_frame,
@@ -2129,16 +2650,21 @@ class SalesFrame(tk.Frame):
             font=FONTS["label_bold"],
             bg="#f0f4ff",
             fg=COLORS["primary"]
-        ).pack(anchor="w", pady=(0, 6))
+        ).pack(anchor="w", pady=(0, 3))
 
         # Margin type
+        m_row = tk.Frame(margin_frame, bg="#f0f4ff")
+        m_row.pack(fill="x", pady=1)
+
         for val, lbl in [
-            ("range",    "Random Range (Recommended)"),
+            ("range",    "Random Range"),
             ("global",   "Fixed Global %"),
-            ("itemwise", "Item-wise (uses range)"),
+            ("flat",     "Fixed Rupee Markup"),
+            ("target_profit", "Target Profit ₹"),
+            ("itemwise", "Item-wise"),
         ]:
             tk.Radiobutton(
-                margin_frame,
+                m_row,
                 text=lbl,
                 variable=self.var_margin_type,
                 value=val,
@@ -2146,13 +2672,13 @@ class SalesFrame(tk.Frame):
                 bg="#f0f4ff",
                 activebackground="#f0f4ff",
                 command=self._on_margin_type_change
-            ).pack(anchor="w", pady=1)
+            ).pack(side="left", padx=(0, 8))
 
         # Range inputs
         self.range_inputs = tk.Frame(
             margin_frame, bg="#f0f4ff"
         )
-        self.range_inputs.pack(fill="x", pady=4)
+        self.range_inputs.pack(fill="x", pady=2)
 
         tk.Label(
             self.range_inputs,
@@ -2166,7 +2692,7 @@ class SalesFrame(tk.Frame):
             self.range_inputs,
             textvariable=self.var_margin_min,
             font=FONTS["body"],
-            width=6,
+            width=5,
             relief="solid", bd=1
         ).pack(side="left", padx=3)
 
@@ -2182,7 +2708,7 @@ class SalesFrame(tk.Frame):
             self.range_inputs,
             textvariable=self.var_margin_max,
             font=FONTS["body"],
-            width=6,
+            width=5,
             relief="solid", bd=1
         ).pack(side="left", padx=3)
 
@@ -2190,7 +2716,7 @@ class SalesFrame(tk.Frame):
         self.global_input = tk.Frame(
             margin_frame, bg="#f0f4ff"
         )
-        self.global_input.pack(fill="x", pady=4)
+        self.global_input.pack(fill="x", pady=2)
 
         tk.Label(
             self.global_input,
@@ -2204,7 +2730,51 @@ class SalesFrame(tk.Frame):
             self.global_input,
             textvariable=self.var_margin_global,
             font=FONTS["body"],
+            width=5,
+            relief="solid", bd=1
+        ).pack(side="left", padx=3)
+
+        # Flat markup input
+        self.flat_input = tk.Frame(
+            margin_frame, bg="#f0f4ff"
+        )
+        self.flat_input.pack(fill="x", pady=2)
+
+        tk.Label(
+            self.flat_input,
+            text="Flat Markup ₹:",
+            font=FONTS["small"],
+            bg="#f0f4ff",
+            fg=COLORS["text_dark"]
+        ).pack(side="left")
+
+        tk.Entry(
+            self.flat_input,
+            textvariable=self.var_flat_markup_amount,
+            font=FONTS["body"],
             width=6,
+            relief="solid", bd=1
+        ).pack(side="left", padx=3)
+
+        # Target profit input
+        self.target_profit_input = tk.Frame(
+            margin_frame, bg="#f0f4ff"
+        )
+        self.target_profit_input.pack(fill="x", pady=2)
+
+        tk.Label(
+            self.target_profit_input,
+            text="Target Profit ₹:",
+            font=FONTS["small"],
+            bg="#f0f4ff",
+            fg=COLORS["text_dark"]
+        ).pack(side="left")
+
+        tk.Entry(
+            self.target_profit_input,
+            textvariable=self.var_target_profit_amount,
+            font=FONTS["body"],
+            width=8,
             relief="solid", bd=1
         ).pack(side="left", padx=3)
 
@@ -2218,50 +2788,47 @@ class SalesFrame(tk.Frame):
             bg=COLORS["accent"],
             fg="white",
             relief="flat",
-            padx=20, pady=12,
+            padx=15, pady=10,
             cursor="hand2",
             command=self._generate_bills
         )
-        self.generate_button.pack(fill="x", pady=5)
+        self.generate_button.pack(fill="x", pady=(3, 2))
         self._set_generate_enabled(True)
 
-        # Tally check button
+        # Action buttons row (Check Tally & Export CSV side-by-side)
+        btn_row = tk.Frame(parent, bg=COLORS["bg_main"])
+        btn_row.pack(fill="x", pady=2)
+
         tk.Button(
-            parent,
+            btn_row,
             text="📊 Check Tally",
             font=FONTS["label_bold"],
             bg=COLORS["primary_light"],
             fg="white",
             relief="flat",
-            padx=15, pady=8,
+            padx=10, pady=7,
             cursor="hand2",
             command=self._check_tally
-        ).pack(fill="x", pady=3)
+        ).pack(side="left", fill="x", expand=True, padx=(0, 3))
 
-        # Export CSV button
         tk.Button(
-            parent,
-            text="📊 Export Bills to CSV",
+            btn_row,
+            text="📁 Export Bills CSV",
             font=FONTS["label_bold"],
             bg=COLORS["success"],
             fg="white",
             relief="flat",
-            padx=15, pady=8,
+            padx=10, pady=7,
             cursor="hand2",
             command=self._export_csv
-        ).pack(fill="x", pady=3)
+        ).pack(side="left", fill="x", expand=True, padx=(3, 0))
 
     def _parse_date_input(self, value: str, label: str) -> date:
-        """Parse DD-MM-YYYY strings from the UI."""
-        value = (value or "").strip()
-        if not value:
-            raise ValueError(f"{label} is required.")
-        try:
-            return datetime.strptime(value, "%d-%m-%Y").date()
-        except ValueError:
-            raise ValueError(
-                f"{label} must be a valid date in DD-MM-YYYY format."
-            )
+        """Parse DD-MM-YYYY, DD/MM/YYYY, or YYYY-MM-DD strings from the UI."""
+        parsed = parse_flexible_date(value)
+        if not parsed:
+            raise ValueError(f"{label} is required and must be a valid date.")
+        return parsed
 
     def _on_margin_type_change(self):
         """Show/hide margin input fields"""
@@ -2284,6 +2851,28 @@ class SalesFrame(tk.Frame):
                 child.configure(
                     state="normal"
                     if mtype == "global"
+                    else "disabled"
+                )
+            except Exception:
+                pass
+
+        # Flat input
+        for child in self.flat_input.winfo_children():
+            try:
+                child.configure(
+                    state="normal"
+                    if mtype == "flat"
+                    else "disabled"
+                )
+            except Exception:
+                pass
+
+        # Target profit input
+        for child in self.target_profit_input.winfo_children():
+            try:
+                child.configure(
+                    state="normal"
+                    if mtype == "target_profit"
                     else "disabled"
                 )
             except Exception:
@@ -2384,6 +2973,30 @@ class SalesFrame(tk.Frame):
     # ----------------------------------------------------------
     # LOAD DATA
     # ----------------------------------------------------------
+    def _on_allocation_mode_change(self):
+        """Show/hide target amount and percentage entries based on allocation mode."""
+        mode = self.var_allocation_mode.get()
+        if hasattr(self, "alloc_target_frame") and hasattr(self, "alloc_pct_frame"):
+            if mode == "target_amount":
+                self.alloc_target_frame.pack(fill="x", pady=2)
+                self.alloc_pct_frame.pack_forget()
+            elif mode == "percentage":
+                self.alloc_pct_frame.pack(fill="x", pady=2)
+                self.alloc_target_frame.pack_forget()
+            else:
+                self.alloc_target_frame.pack_forget()
+                self.alloc_pct_frame.pack_forget()
+
+    def _on_customer_mode_change(self):
+        """Enable/disable custom cash name entry based on customer mode."""
+        is_cash = (self.var_customer_mode.get() == "cash")
+        state = "normal" if is_cash else "disabled"
+        if hasattr(self, "cash_name_ent"):
+            self.cash_name_ent.configure(state=state)
+        if hasattr(self, "cash_name_label"):
+            fg = COLORS["text_dark"] if is_cash else COLORS["text_muted"]
+            self.cash_name_label.configure(fg=fg)
+
     def _load_data(self):
         """Load purchase pool and existing sales bills"""
         month = self.filter_month.get()
@@ -2401,35 +3014,67 @@ class SalesFrame(tk.Frame):
                 fg="white"
             )
 
-    def _load_pool_summary(self, month: int, year: int):
-        """Show purchase pool summary"""
+    def _load_pool_summary(self, month: int = None, year: int = None):
+        """Show purchase pool summary with carried-forward stock details"""
         for w in self.pool_info_frame.winfo_children():
             w.destroy()
 
-        # Get pool totals
-        totals = db.query_one("""
+        s_date = parse_flexible_date(self.var_filter_from.get())
+        e_date = parse_flexible_date(self.var_filter_to.get())
+        if not s_date or not e_date:
+            s_date, e_date = get_date_range_for_preset("This Month")
+
+        s_str = s_date.strftime("%Y-%m-%d")
+        e_str = e_date.strftime("%Y-%m-%d")
+
+        preset = self.var_date_preset.get() if hasattr(self, "var_date_preset") else "Current Period"
+        if hasattr(self, "pool_title_lbl") and self.pool_title_lbl:
+            self.pool_title_lbl.config(text=f"📦 Stock Inventory Pool ({preset})")
+
+        # 1. Carried-forward unsold purchases (before s_date)
+        carried = db.query_one("""
             SELECT
                 COUNT(DISTINCT pb.id) AS bill_count,
-                COUNT(pi.id)          AS item_count,
-                COALESCE(SUM(pi.quantity), 0)
-                    AS total_qty,
-                COALESCE(SUM(pi.remaining_qty), 0)
-                    AS remaining_qty,
-                COALESCE(SUM(pb.grand_total), 0)
-                    AS purchase_total
-            FROM purchase_bills pb
-            JOIN purchase_items pi
-                ON pi.purchase_bill_id = pb.id
-            WHERE pb.bill_month=? AND pb.bill_year=?
-        """, (month, year))
+                COUNT(pi.id) AS item_count,
+                COALESCE(SUM(pi.remaining_qty), 0) AS remaining_qty,
+                COALESCE(SUM(pi.remaining_qty * pi.purchase_rate), 0) AS valuation
+            FROM purchase_items pi
+            JOIN purchase_bills pb ON pi.purchase_bill_id = pb.id
+            WHERE pb.bill_date < ? AND pi.remaining_qty > 0.0001
+        """, (s_str,))
 
-        if not totals or totals.get(
-            "bill_count", 0
-        ) == 0:
+        # 2. Purchases in selected date range (queried directly from purchase_bills)
+        period_bills = db.query_one("""
+            SELECT
+                COUNT(*) AS bill_count,
+                COALESCE(SUM(subtotal), 0) AS purchase_taxable,
+                COALESCE(SUM(grand_total), 0) AS purchase_total
+            FROM purchase_bills
+            WHERE bill_date >= ? AND bill_date <= ?
+        """, (s_str, e_str))
+
+        # Items in selected date range
+        period_items = db.query_one("""
+            SELECT
+                COUNT(pi.id) AS item_count,
+                COALESCE(SUM(pi.quantity), 0) AS total_qty,
+                COALESCE(SUM(pi.remaining_qty), 0) AS remaining_qty,
+                COALESCE(SUM(pi.remaining_qty * pi.purchase_rate), 0) AS valuation
+            FROM purchase_items pi
+            JOIN purchase_bills pb ON pi.purchase_bill_id = pb.id
+            WHERE pb.bill_date >= ? AND pb.bill_date <= ?
+        """, (s_str, e_str))
+
+        # 3. Total active stock available (carried forward + period)
+        total_active_val = (carried.get("valuation", 0) or 0) + (period_items.get("valuation", 0) or 0)
+        total_active_qty = (carried.get("remaining_qty", 0) or 0) + (period_items.get("remaining_qty", 0) or 0)
+        total_active_items = (carried.get("item_count", 0) or 0) + (period_items.get("item_count", 0) or 0)
+
+        if total_active_items == 0:
             tk.Label(
                 self.pool_info_frame,
-                text="⚠️  No purchase bills found.\n"
-                     "Add purchase bills first.",
+                text="⚠️  No active stock available.\n"
+                     "Add purchase bills first or expand date range.",
                 font=FONTS["body"],
                 bg=COLORS["bg_card"],
                 fg=COLORS["warning"]
@@ -2439,104 +3084,96 @@ class SalesFrame(tk.Frame):
 
         self._set_generate_enabled(True)
 
-        month_name = MONTH_NAMES[month]
-        remaining  = totals.get("remaining_qty", 0)
-        total_qty  = totals.get("total_qty", 0)
-        pct_done   = (
-            round(
-                (total_qty - remaining) /
-                total_qty * 100
-            )
-            if total_qty > 0 else 0
-        )
-
-        stats = [
-            ("Purchase Bills", str(totals["bill_count"])),
-            ("Unique Items",   str(totals["item_count"])),
-            ("Total Stock",    f"{total_qty:.1f} units"),
-            ("Remaining",      f"{remaining:.1f} units"),
-            ("Purchase Total",
-             f"₹{totals['purchase_total']:,.2f}"),
-            ("Distributed",    f"{pct_done}%"),
+        items = [
+            ("Carried Forward:", f"₹{carried.get('valuation', 0):,.2f}",
+             "Stock:", f"{carried.get('remaining_qty', 0):.1f} units"),
+            ("New Purchases:",   f"₹{period_bills.get('purchase_taxable', 0):,.2f}",
+             "Bills:", f"{period_bills.get('bill_count', 0)} bills"),
+            ("Total Stock Value:", f"₹{total_active_val:,.2f}",
+             "Available:", f"{total_active_qty:.1f} units"),
         ]
 
-        for i, (label, value) in enumerate(stats):
-            row = tk.Frame(
-                self.pool_info_frame,
-                bg=COLORS["bg_card"]
-            )
-            row.pack(fill="x", pady=2)
+        for l1, v1, l2, v2 in items:
+            row = tk.Frame(self.pool_info_frame, bg=COLORS["bg_card"])
+            row.pack(fill="x", pady=1)
 
             tk.Label(
-                row,
-                text=label + ":",
+                row, text=l1,
                 font=FONTS["label_bold"],
                 bg=COLORS["bg_card"],
                 fg=COLORS["text_muted"],
-                width=18, anchor="w"
+                width=16, anchor="w"
             ).pack(side="left")
 
             tk.Label(
-                row,
-                text=value,
+                row, text=v1,
                 font=FONTS["label_bold"],
                 bg=COLORS["bg_card"],
-                fg=COLORS["primary"]
+                fg=COLORS["primary"],
+                width=13, anchor="w"
             ).pack(side="left")
 
-        # Progress bar
-        if total_qty > 0:
-            prog_frame = tk.Frame(
-                self.pool_info_frame,
-                bg=COLORS["border"],
-                height=8
-            )
-            prog_frame.pack(fill="x", pady=(5, 0))
+            tk.Label(
+                row, text=l2,
+                font=FONTS["label_bold"],
+                bg=COLORS["bg_card"],
+                fg=COLORS["text_muted"],
+                width=10, anchor="w"
+            ).pack(side="left")
 
-            prog_done = tk.Frame(
-                prog_frame,
-                bg=COLORS["success"],
-                height=8
-            )
-            prog_done.place(
-                relx=0, rely=0,
-                relwidth=pct_done / 100,
-                relheight=1
-            )
+            tk.Label(
+                row, text=v2,
+                font=FONTS["label_bold"],
+                bg=COLORS["bg_card"],
+                fg=COLORS["primary"],
+                anchor="w"
+            ).pack(side="left")
 
-    def _load_existing_bills(
-        self, month: int, year: int
-    ):
-        """Load and display existing sales bills"""
+    def _load_existing_bills(self, month: int = None, year: int = None):
+        """Load and display existing sales bills within the selected date range"""
         for w in self.bills_body.winfo_children():
             w.destroy()
 
-        bills = db.query("""
-            SELECT
-                sb.*,
-                (SELECT COUNT(*) FROM sales_items si
-                 WHERE si.sales_bill_id = sb.id
-                ) AS item_count
-            FROM sales_bills sb
-            WHERE sb.bill_month=? AND sb.bill_year=?
-            ORDER BY sb.bill_date, sb.bill_number
-        """, (month, year))
+        preset = self.var_date_preset.get()
+        if preset == "All Time":
+            bills = db.query("""
+                SELECT
+                    sb.*,
+                    (SELECT COUNT(*) FROM sales_items si
+                     WHERE si.sales_bill_id = sb.id
+                    ) AS item_count
+                FROM sales_bills sb
+                ORDER BY sb.bill_date DESC, sb.bill_number DESC
+            """)
+        else:
+            s_date = parse_flexible_date(self.var_filter_from.get())
+            e_date = parse_flexible_date(self.var_filter_to.get())
+            if not s_date or not e_date:
+                s_date, e_date = get_date_range_for_preset("This Month")
+            s_str = s_date.strftime("%Y-%m-%d")
+            e_str = e_date.strftime("%Y-%m-%d")
 
-        # Summary
+            bills = db.query("""
+                SELECT
+                    sb.*,
+                    (SELECT COUNT(*) FROM sales_items si
+                     WHERE si.sales_bill_id = sb.id
+                    ) AS item_count
+                FROM sales_bills sb
+                WHERE sb.bill_date >= ? AND sb.bill_date <= ?
+                ORDER BY sb.bill_date DESC, sb.bill_number DESC
+            """, (s_str, e_str))
+
         if bills:
-            total = sum(
-                b["grand_total"] for b in bills
-            )
+            total = sum(b["grand_total"] for b in bills)
             self.existing_summary.configure(
-                text=f"  {len(bills)} bills  |  "
-                     f"Total: ₹{total:,.2f}",
+                text=f"  {len(bills)} bills  |  Total: ₹{total:,.2f}",
                 bg=COLORS["success_light"],
                 fg=COLORS["success"]
             )
         else:
             self.existing_summary.configure(
-                text="  No sales bills generated yet "
-                     "for this month.",
+                text="  No sales bills generated yet for this period.",
                 bg=COLORS["warning_light"],
                 fg=COLORS["warning"]
             )
@@ -2544,8 +3181,7 @@ class SalesFrame(tk.Frame):
         if not bills:
             tk.Label(
                 self.bills_body,
-                text="No sales bills for this month.\n"
-                     "Use the Generate panel on the left.",
+                text="No sales bills for this period.\nUse the Generate panel on the left.",
                 font=FONTS["body"],
                 bg=COLORS["bg_card"],
                 fg=COLORS["text_muted"],
@@ -2672,12 +3308,9 @@ class SalesFrame(tk.Frame):
                 self.var_end_date.get(), "End date"
             )
             if start_date > end_date:
-                raise ValueError("Start date cannot be after end date.")
-            if start_date.month != month or end_date.month != month or \
-               start_date.year != year or end_date.year != year:
-                raise ValueError(
-                    "Date limits must fall within the selected month and year."
-                )
+                start_date, end_date = end_date, start_date
+                self.var_start_date.set(format_date_display(start_date))
+                self.var_end_date.set(format_date_display(end_date))
         except ValueError as exc:
             messagebox.showerror("Date Error", str(exc))
             return
@@ -2692,18 +3325,20 @@ class SalesFrame(tk.Frame):
             )
             return
 
-        # Check for existing bills
+        # Check for existing bills within this date range
+        s_str = start_date.strftime("%Y-%m-%d")
+        e_str = end_date.strftime("%Y-%m-%d")
         existing = db.query_one("""
             SELECT COUNT(*) AS cnt
             FROM sales_bills
-            WHERE bill_month=? AND bill_year=?
-        """, (month, year))
+            WHERE bill_date >= ? AND bill_date <= ?
+        """, (s_str, e_str))
 
         if existing.get("cnt", 0) > 0:
             if not messagebox.askyesno(
                 "Bills Exist",
-                f"Sales bills already exist for "
-                f"{MONTH_NAMES[month]} {year}.\n\n"
+                f"{existing['cnt']} sales bills already exist between "
+                f"{format_date_display(start_date)} and {format_date_display(end_date)}.\n\n"
                 "Generating new bills will be IN ADDITION\n"
                 "to existing ones.\n\n"
                 "Continue?"
@@ -2722,8 +3357,8 @@ class SalesFrame(tk.Frame):
             )
 
             bills = splitter.split(
-                month=month,
-                year=year,
+                month=start_date.month,
+                year=start_date.year,
                 n_bills=n_bills,
                 min_items_per_bill=min_items,
                 max_items_per_bill=max_items,
@@ -2733,8 +3368,24 @@ class SalesFrame(tk.Frame):
                 override_margin_max=margin_max,
                 override_margin_global=
                     self.var_margin_global.get(),
+                override_flat_markup_amount=
+                    self.var_flat_markup_amount.get(),
+                override_target_profit_amount=
+                    self.var_target_profit_amount.get(),
                 start_date=start_date,
                 end_date=end_date,
+                include_carried_forward=
+                    self.var_include_carried_forward.get(),
+                allocation_mode=
+                    self.var_allocation_mode.get(),
+                target_sales_amount=
+                    self.var_target_sales_amount.get(),
+                stock_percentage=
+                    self.var_stock_percentage.get(),
+                customer_mode=
+                    self.var_customer_mode.get(),
+                cash_name=
+                    self.var_cash_name.get().strip(),
             )
 
             if not bills:
@@ -2748,7 +3399,9 @@ class SalesFrame(tk.Frame):
 
             # Verify tally
             tally = splitter.verify_tally(
-                month, year, bills
+                start_date=start_date,
+                end_date=end_date,
+                generated_bills=bills,
             )
 
             # Store for later use
@@ -2760,8 +3413,8 @@ class SalesFrame(tk.Frame):
                 self,
                 bills=bills,
                 tally=tally,
-                month=month,
-                year=year,
+                month=start_date.month,
+                year=start_date.year,
                 on_confirm_callback=self._save_bills,
                 on_regenerate_callback=
                     self._generate_bills,
@@ -2783,10 +3436,7 @@ class SalesFrame(tk.Frame):
     # ----------------------------------------------------------
     def _save_bills(self, bills: list):
         """Save confirmed bills to database"""
-        month    = self.filter_month.get()
-        year     = self.filter_year.get()
         settings = load_settings()
-
         bill_num_mgr = BillNumberManager(settings)
 
         saved_count = 0
@@ -2799,10 +3449,14 @@ class SalesFrame(tk.Frame):
 
                 bill_date = bill["bill_date"]
                 if isinstance(bill_date, date):
-                    bill_date_str = \
-                        bill_date.strftime("%Y-%m-%d")
+                    bill_date_str = bill_date.strftime("%Y-%m-%d")
+                    b_month = bill_date.month
+                    b_year = bill_date.year
                 else:
-                    bill_date_str = str(bill_date)
+                    bd = parse_flexible_date(str(bill_date))
+                    bill_date_str = bd.strftime("%Y-%m-%d") if bd else str(bill_date)
+                    b_month = bd.month if bd else self.filter_month.get()
+                    b_year = bd.year if bd else self.filter_year.get()
 
                 # Save or get customer
                 customer_name = bill["customer"]["name"]
@@ -2842,14 +3496,14 @@ class SalesFrame(tk.Frame):
                     customer_id,
                     customer_name,
                     bill_date_str,
-                    month, year,
+                    b_month, b_year,
                     bill["subtotal"],
                     bill["total_cgst"],
                     bill["total_sgst"],
                     bill["grand_total"],
                     bill["bill_type"],
                     bill["margin_avg"],
-                    month, year
+                    b_month, b_year
                 ))
 
                 # Save items
@@ -2900,7 +3554,7 @@ class SalesFrame(tk.Frame):
                     sales_bill_id,
                     bill_number,
                     bill,
-                    month, year,
+                    b_month, b_year,
                     settings
                 )
 
@@ -2910,8 +3564,14 @@ class SalesFrame(tk.Frame):
                 errors.append(str(e))
                 bill_num_mgr.rollback_number()
 
-        # Update monthly summary
-        self._update_monthly_summary(month, year)
+        # Update monthly summary for all affected months
+        affected_months = set()
+        for b in bills:
+            bd = parse_flexible_date(b["bill_date"])
+            if bd:
+                affected_months.add((bd.month, bd.year))
+        for m, y in affected_months:
+            self._update_monthly_summary(m, y)
 
         # Reload UI
         self._load_data()

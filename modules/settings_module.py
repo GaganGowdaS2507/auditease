@@ -9,6 +9,7 @@ from tkinter import ttk, messagebox, filedialog
 import json
 import os
 import re
+import sqlite3
 from pathlib import Path
 
 # ============================================================
@@ -17,6 +18,7 @@ from pathlib import Path
 BASE_DIR    = Path(__file__).parent.parent
 CONFIG_PATH = BASE_DIR / "config" / "settings.json"
 ASSETS_DIR  = BASE_DIR / "assets"
+DB_PATH     = BASE_DIR / "database" / "shop_database.db"
 
 # ============================================================
 # COLORS & FONTS
@@ -133,7 +135,9 @@ def _default_settings() -> dict:
             "default_margin_type":   "range",
             "default_margin_min":    10,
             "default_margin_max":    20,
-            "default_margin_global": 15
+            "default_margin_global": 15,
+            "flat_markup_amount":    5,
+            "target_profit_amount":  0
         },
         "print": {
             "paper_size":      "both",
@@ -272,19 +276,35 @@ class SettingsFrame(tk.Frame):
             fg=COLORS["text_muted"]
         ).pack(side="left", padx=(15, 0), pady=(8, 0))
 
-        # Save button — always visible at top
+        # Top action buttons
+        btn_box = tk.Frame(top, bg=COLORS["bg_main"])
+        btn_box.pack(side="right")
+
         tk.Button(
-            top,
+            btn_box,
+            text="🗑️  Reset All Data",
+            font=FONTS["button"],
+            bg=COLORS["danger"],
+            fg="white",
+            relief="flat",
+            padx=14,
+            pady=8,
+            cursor="hand2",
+            command=self._clear_all_data
+        ).pack(side="left", padx=(0, 10))
+
+        tk.Button(
+            btn_box,
             text="💾  Save All Settings",
             font=FONTS["button"],
             bg=COLORS["success"],
             fg="white",
             relief="flat",
-            padx=20,
+            padx=18,
             pady=8,
             cursor="hand2",
             command=self._save_all
-        ).pack(side="right")
+        ).pack(side="left")
 
     def _build_tabs(self):
         """Tab buttons + content area"""
@@ -920,6 +940,12 @@ class SettingsFrame(tk.Frame):
             "global":
                 "Fixed Global % "
                 "(Same margin for all items)",
+            "flat":
+                "Fixed Rupee Markup  "
+                "(Purchase Rate + ₹X)",
+            "target_profit":
+                "Target Profit ₹  "
+                "(Set exact desired total profit in ₹)",
             "itemwise":
                 "Item-wise %   "
                 "(Set per item while entering bill)",
@@ -1049,6 +1075,92 @@ class SettingsFrame(tk.Frame):
             sticky="w", padx=(10, 0)
         )
 
+        # Flat markup frame
+        self.flat_frame = tk.Frame(
+            card2, bg="#fff8e1",
+            padx=15, pady=10
+        )
+        self.flat_frame.grid(
+            row=3, column=0, columnspan=3,
+            sticky="w", pady=5
+        )
+
+        tk.Label(
+            self.flat_frame,
+            text="Flat Markup ₹",
+            font=FONTS["label_bold"],
+            bg="#fff8e1",
+            fg=COLORS["text_dark"]
+        ).grid(
+            row=0, column=0,
+            sticky="w", padx=(0, 15), pady=5
+        )
+
+        self.vars["flat_markup_amount"] = tk.StringVar(
+            value="5"
+        )
+        tk.Entry(
+            self.flat_frame,
+            textvariable=self.vars["flat_markup_amount"],
+            font=FONTS["body"],
+            width=8,
+            relief="solid", bd=1
+        ).grid(row=0, column=1, sticky="w", pady=5)
+
+        tk.Label(
+            self.flat_frame,
+            text="Fixed ₹ amount added to purchase rate for each item",
+            font=FONTS["small"],
+            bg="#fff8e1",
+            fg=COLORS["text_muted"]
+        ).grid(
+            row=0, column=2,
+            sticky="w", padx=(10, 0)
+        )
+
+        # Target profit frame
+        self.target_profit_frame = tk.Frame(
+            card2, bg="#ede7f6",
+            padx=15, pady=10
+        )
+        self.target_profit_frame.grid(
+            row=4, column=0, columnspan=3,
+            sticky="w", pady=5
+        )
+
+        tk.Label(
+            self.target_profit_frame,
+            text="Target Profit ₹",
+            font=FONTS["label_bold"],
+            bg="#ede7f6",
+            fg=COLORS["text_dark"]
+        ).grid(
+            row=0, column=0,
+            sticky="w", padx=(0, 15), pady=5
+        )
+
+        self.vars["target_profit_amount"] = tk.StringVar(
+            value="0"
+        )
+        tk.Entry(
+            self.target_profit_frame,
+            textvariable=self.vars["target_profit_amount"],
+            font=FONTS["body"],
+            width=10,
+            relief="solid", bd=1
+        ).grid(row=0, column=1, sticky="w", pady=5)
+
+        tk.Label(
+            self.target_profit_frame,
+            text="Desired monthly sales profit in ₹ (exact total achieved)",
+            font=FONTS["small"],
+            bg="#ede7f6",
+            fg=COLORS["text_muted"]
+        ).grid(
+            row=0, column=2,
+            sticky="w", padx=(10, 0)
+        )
+
         self._on_margin_type_change()
 
         # Card 3 — Paper Size
@@ -1108,6 +1220,30 @@ class SettingsFrame(tk.Frame):
                 )
             except Exception:
                 pass
+
+        # Flat frame — enable only for flat
+        if hasattr(self, "flat_frame"):
+            for child in self.flat_frame.winfo_children():
+                try:
+                    child.configure(
+                        state="normal"
+                        if mtype == "flat"
+                        else "disabled"
+                    )
+                except Exception:
+                    pass
+
+        # Target profit frame — enable only for target_profit
+        if hasattr(self, "target_profit_frame"):
+            for child in self.target_profit_frame.winfo_children():
+                try:
+                    child.configure(
+                        state="normal"
+                        if mtype == "target_profit"
+                        else "disabled"
+                    )
+                except Exception:
+                    pass
 
     # ----------------------------------------------------------
     # TAB 4: STORAGE SETTINGS
@@ -1199,6 +1335,44 @@ class SettingsFrame(tk.Frame):
             sticky="w", pady=(15, 5)
         )
 
+        # Card 2 — Danger Zone / Full Reset
+        card_reset = make_card(
+            frame,
+            "⚠️ Database & Test Data Reset",
+            COLORS["danger"]
+        )
+
+        tk.Label(
+            card_reset,
+            text="Completely clear all previous transactions, purchase bills, sales bills, and reset invoice numbering.\n"
+                 "Use this whenever you want to test with a clean slate.\n\n"
+                 "• Clears: Purchase Bills, Sales Bills, Monthly Summaries, Auto-generated Customers, Item Master entries.\n"
+                 "• Resets: Sales invoice sequence counter back to #1.\n"
+                 "• Preserves: Shop profile, GST configuration, Bank accounts, and Billing preferences.",
+            font=FONTS["body"],
+            bg=COLORS["bg_card"],
+            fg=COLORS["text_dark"],
+            justify="left"
+        ).grid(
+            row=0, column=0, columnspan=3,
+            sticky="w", pady=(0, 15)
+        )
+
+        tk.Button(
+            card_reset,
+            text="🗑️ Reset & Clear All Data",
+            font=FONTS["button"],
+            bg=COLORS["danger"],
+            fg="white",
+            relief="flat",
+            padx=18, pady=10,
+            cursor="hand2",
+            command=self._clear_all_data
+        ).grid(
+            row=1, column=0,
+            sticky="w", pady=(0, 5)
+        )
+
     def _browse_folder(self):
         """Open folder browser"""
         folder = filedialog.askdirectory(
@@ -1218,6 +1392,95 @@ class SettingsFrame(tk.Frame):
                 "Folder Not Found",
                 "Bills folder does not exist yet.\n"
                 "Save settings first."
+            )
+
+    def _clear_all_data(self):
+        """Completely reset all transaction data, purchase/sales bills, inventory, and counters for testing."""
+        confirmed = messagebox.askyesno(
+            "Confirm Full Data Reset",
+            "Are you sure you want to completely clear all previous transaction data?\n\n"
+            "This will permanently delete:\n"
+            " • All Purchase Bills and line items\n"
+            " • All Sales Bills and line items\n"
+            " • All Monthly Summaries\n"
+            " • Auto-generated customer records\n"
+            " • Auto-learned Item Master catalog entries\n"
+            " • Uploaded and generated bill files in storage\n"
+            " • Reset sales invoice numbering back to #1\n\n"
+            "Shop Settings, GST profile, and Bank Details will NOT be deleted.\n\n"
+            "Proceed with the reset?",
+            icon="warning"
+        )
+        if not confirmed:
+            return
+
+        try:
+            # 1. Clean Database
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute("BEGIN TRANSACTION")
+            cur.execute("DELETE FROM sales_items")
+            cur.execute("DELETE FROM sales_bills")
+            cur.execute("DELETE FROM purchase_items")
+            cur.execute("DELETE FROM purchase_bills")
+            cur.execute("DELETE FROM monthly_summary")
+            cur.execute("DELETE FROM bill_number_tracker")
+            cur.execute("DELETE FROM customers WHERE is_auto_generated = 1")
+            cur.execute("DELETE FROM items_master")
+            cur.execute("""
+                DELETE FROM sqlite_sequence WHERE name IN (
+                    'sales_items',
+                    'sales_bills',
+                    'purchase_items',
+                    'purchase_bills',
+                    'monthly_summary',
+                    'bill_number_tracker',
+                    'customers',
+                    'items_master'
+                )
+            """)
+            conn.commit()
+            cur.execute("VACUUM")
+            conn.close()
+
+            # 2. Reset invoice counter in settings.json
+            current_settings = load_settings()
+            if "billing" in current_settings:
+                start_no = current_settings["billing"].get("bill_start_number", 1)
+                current_settings["billing"]["current_bill_number"] = start_no
+                save_settings(current_settings)
+                self.settings = current_settings
+                if "current_bill_no" in self.vars:
+                    self.vars["current_bill_no"].set(str(start_no))
+
+            # 3. Clean files in bills storage folder
+            bills_folder = Path(self.vars.get("bills_folder", {}).get() if hasattr(self.vars.get("bills_folder"), "get") else (BASE_DIR / "bills"))
+            if bills_folder.exists():
+                for root, dirs, files in os.walk(bills_folder):
+                    for f in files:
+                        if f != ".gitkeep":
+                            try:
+                                os.remove(os.path.join(root, f))
+                            except Exception:
+                                pass
+
+            # 4. Notify app
+            if hasattr(self, "app") and self.app:
+                self.app.set_status("All previous data cleared successfully. System reset to fresh state.", "info")
+
+            messagebox.showinfo(
+                "Reset Successful",
+                "✅ All previous data has been completely cleared!\n\n"
+                "• Inventory and stock pools reset to 0\n"
+                "• All purchase and sales bills removed\n"
+                "• Invoice number tracker reset to #1\n"
+                "• Bills storage folder cleaned\n\n"
+                "System is ready for clean testing."
+            )
+        except Exception as exc:
+            messagebox.showerror(
+                "Reset Failed",
+                f"Failed to reset data:\n{exc}"
             )
 
     # ----------------------------------------------------------
@@ -1324,6 +1587,8 @@ class SettingsFrame(tk.Frame):
 
         v("flat_markup_amount",
           billing.get("flat_markup_amount", 5))
+        v("target_profit_amount",
+          billing.get("target_profit_amount", 0))
 
         paper = s.get("print", {}).get(
             "paper_size", "both"
@@ -1477,6 +1742,8 @@ class SettingsFrame(tk.Frame):
                 float(get("margin_global") or "15"),
             "flat_markup_amount":
                 float(get("flat_markup_amount") or "5"),
+            "target_profit_amount":
+                float(get("target_profit_amount") or "0"),
         })
 
         # Update print section

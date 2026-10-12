@@ -17,6 +17,14 @@ import json
 from pathlib import Path
 from datetime import date, datetime
 import calendar
+from modules.date_utils import (
+    DATE_PRESETS,
+    get_date_range_for_preset,
+    parse_flexible_date,
+    format_date_display,
+    format_date_iso,
+    get_financial_year,
+)
 
 # ============================================================
 # PATHS
@@ -147,8 +155,11 @@ class DashboardFrame(tk.Frame):
         self.app      = app
         self.settings = load_settings()
 
-        # Current view month/year
         today = date.today()
+        self.preset_var = tk.StringVar(value="This Month")
+        s_date, e_date = get_date_range_for_preset("This Month")
+        self.from_date_var = tk.StringVar(value=format_date_display(s_date) if s_date else "")
+        self.to_date_var   = tk.StringVar(value=format_date_display(e_date) if e_date else "")
         self.view_month = tk.IntVar(value=today.month)
         self.view_year  = tk.IntVar(value=today.year)
 
@@ -215,10 +226,10 @@ class DashboardFrame(tk.Frame):
 
 
     # ----------------------------------------------------------
-    # TOP BAR — Title + Month/Year selector
+    # TOP BAR — Title + Date Range Selector
     # ----------------------------------------------------------
     def _build_top_bar(self):
-        """Title row with month/year picker and refresh"""
+        """Title row with date range presets and refresh"""
         top = tk.Frame(
             self.scroll_frame,
             bg=COLORS["bg_main"]
@@ -246,52 +257,63 @@ class DashboardFrame(tk.Frame):
         )
         self.subtitle_label.pack(anchor="w")
 
-        # Right — Month/Year selector + Refresh
+        # Right — Period presets + From/To dates + Refresh
         right = tk.Frame(top, bg=COLORS["bg_main"])
         right.pack(side="right")
 
         tk.Label(
             right,
-            text="View Month:",
+            text="Period:",
             font=FONTS["label_bold"],
             bg=COLORS["bg_main"],
             fg=COLORS["text_dark"]
-        ).pack(side="left", padx=(0, 5))
+        ).pack(side="left", padx=(0, 4))
 
-        # Month dropdown
-        month_cb = ttk.Combobox(
+        self.preset_cb = ttk.Combobox(
             right,
-            values=MONTH_NAMES[1:],
-            width=12,
+            values=DATE_PRESETS,
+            width=15,
             font=FONTS["body"],
             state="readonly"
         )
-        month_cb.set(MONTH_NAMES[self.view_month.get()])
-        month_cb.pack(side="left", padx=5)
-        month_cb.bind(
+        self.preset_cb.set(self.preset_var.get())
+        self.preset_cb.pack(side="left", padx=3)
+        self.preset_cb.bind(
             "<<ComboboxSelected>>",
-            lambda e: self._on_month_change(month_cb.get())
+            self._on_preset_change
         )
-        self.month_cb = month_cb
 
-        # Year dropdown
-        current_year = date.today().year
-        years = [str(y) for y in range(current_year - 3,
-                                        current_year + 2)]
-        year_cb = ttk.Combobox(
+        tk.Label(
             right,
-            values=years,
-            width=8,
-            font=FONTS["body"],
-            state="readonly"
+            text="From:",
+            font=FONTS["label"],
+            bg=COLORS["bg_main"],
+            fg=COLORS["text_muted"]
+        ).pack(side="left", padx=(6, 2))
+
+        self.from_ent = tk.Entry(
+            right,
+            textvariable=self.from_date_var,
+            width=11,
+            font=FONTS["body"]
         )
-        year_cb.set(str(self.view_year.get()))
-        year_cb.pack(side="left", padx=5)
-        year_cb.bind(
-            "<<ComboboxSelected>>",
-            lambda e: self._on_year_change(year_cb.get())
+        self.from_ent.pack(side="left", padx=2)
+
+        tk.Label(
+            right,
+            text="To:",
+            font=FONTS["label"],
+            bg=COLORS["bg_main"],
+            fg=COLORS["text_muted"]
+        ).pack(side="left", padx=(4, 2))
+
+        self.to_ent = tk.Entry(
+            right,
+            textvariable=self.to_date_var,
+            width=11,
+            font=FONTS["body"]
         )
-        self.year_cb = year_cb
+        self.to_ent.pack(side="left", padx=2)
 
         # Refresh button
         tk.Button(
@@ -307,15 +329,28 @@ class DashboardFrame(tk.Frame):
             command=self._load_dashboard_data
         ).pack(side="left", padx=(10, 0))
 
-
-    def _on_month_change(self, month_name: str):
-        self.view_month.set(MONTH_NAMES.index(month_name))
+    def _on_preset_change(self, event=None):
+        preset = self.preset_cb.get()
+        self.preset_var.set(preset)
+        s, e = get_date_range_for_preset(preset)
+        if s:
+            self.from_date_var.set(format_date_display(s))
+            self.view_month.set(s.month)
+            self.view_year.set(s.year)
+        else:
+            self.from_date_var.set("")
+        if e:
+            self.to_date_var.set(format_date_display(e))
+        else:
+            self.to_date_var.set("")
         self._load_dashboard_data()
 
-    def _on_year_change(self, year_str: str):
-        self.view_year.set(int(year_str))
-        self._load_dashboard_data()
-
+    def _get_active_date_range(self):
+        s_raw = self.from_date_var.get().strip()
+        e_raw = self.to_date_var.get().strip()
+        s_date = parse_flexible_date(s_raw) if s_raw else None
+        e_date = parse_flexible_date(e_raw) if e_raw else None
+        return s_date, e_date
 
     # ----------------------------------------------------------
     # STAT CARDS ROW
@@ -343,14 +378,14 @@ class DashboardFrame(tk.Frame):
              "📥", "#1565c0", row1),
             ("sales_total",    "Total Sales",
              "📤", "#2e7d32", row1),
-            ("profit_total",   "Total Profit",
-             "💰", "#e65100", row1),
+            ("stock_total",    "Active Stock on Hand",
+             "📦", "#00838f", row1),
             # Row 2
+            ("profit_total",   "Gross Profit",
+             "💰", "#e65100", row2),
             ("gst_payable",    "GST Payable",
              "🧾", "#6a1b9a", row2),
-            ("bills_count",    "Bills Generated",
-             "📄", "#00695c", row2),
-            ("tally_status",   "Tally Status",
+            ("tally_status",   "Inventory Tally",
              "✅", "#1b5e20", row2),
         ]
 
@@ -612,120 +647,166 @@ class DashboardFrame(tk.Frame):
     # ----------------------------------------------------------
     def _load_dashboard_data(self):
         """Fetch all data from DB and update UI"""
-        month = self.view_month.get()
-        year  = self.view_year.get()
-
-        # Update subtitle
-        self.subtitle_label.configure(
-            text=f"Showing data for "
-                 f"{MONTH_NAMES[month]} {year}"
-        )
+        s_date, e_date = self._get_active_date_range()
+        if s_date and e_date:
+            subtitle = f"Showing data from {format_date_display(s_date)} to {format_date_display(e_date)}"
+        elif s_date:
+            subtitle = f"Showing data from {format_date_display(s_date)} onwards"
+        elif e_date:
+            subtitle = f"Showing data up to {format_date_display(e_date)}"
+        else:
+            subtitle = "Showing all time data"
+        self.subtitle_label.configure(text=subtitle)
 
         # Load each section
-        self._load_stat_cards(month, year)
-        self._load_recent_bills(month, year)
-        self._load_year_overview(year)
+        self._load_stat_cards(s_date, e_date)
+        self._load_recent_bills(s_date, e_date)
+        self._load_year_overview(self.view_year.get())
 
 
     # ----------------------------------------------------------
     # STAT CARDS DATA
     # ----------------------------------------------------------
-    def _load_stat_cards(self, month: int, year: int):
-        """Fetch monthly stats and update cards"""
+    def _load_stat_cards(self, s_date=None, e_date=None):
+        """Fetch stats for the date range and update cards"""
+        conds_p = []
+        conds_s = []
+        params_p = []
+        params_s = []
 
-        # ---- Purchase totals ----
-        p = db.query_one("""
+        if s_date:
+            conds_p.append("pb.bill_date >= ?")
+            params_p.append(format_date_iso(s_date))
+            conds_s.append("sb.bill_date >= ?")
+            params_s.append(format_date_iso(s_date))
+        if e_date:
+            conds_p.append("pb.bill_date <= ?")
+            params_p.append(format_date_iso(e_date))
+            conds_s.append("sb.bill_date <= ?")
+            params_s.append(format_date_iso(e_date))
+
+        where_p = f"WHERE {' AND '.join(conds_p)}" if conds_p else ""
+        where_s = f"WHERE {' AND '.join(conds_s)}" if conds_s else ""
+
+        # ---- Purchase totals in period ----
+        p = db.query_one(f"""
             SELECT
-                COUNT(*)            AS bill_count,
+                COUNT(*)                      AS bill_count,
                 COALESCE(SUM(subtotal),    0) AS total_taxable,
                 COALESCE(SUM(total_gst),   0) AS total_gst,
                 COALESCE(SUM(grand_total), 0) AS grand_total
-            FROM purchase_bills
-            WHERE bill_month=? AND bill_year=?
-        """, (month, year))
+            FROM purchase_bills pb
+            {where_p}
+        """, tuple(params_p))
 
-        # ---- Sales totals ----
-        s = db.query_one("""
+        # ---- Sales totals in period ----
+        s = db.query_one(f"""
             SELECT
-                COUNT(*)                   AS bill_count,
+                COUNT(*)                      AS bill_count,
                 COALESCE(SUM(subtotal),    0) AS total_taxable,
                 COALESCE(SUM(total_cgst),  0) AS total_cgst,
                 COALESCE(SUM(total_sgst),  0) AS total_sgst,
                 COALESCE(SUM(grand_total), 0) AS grand_total
-            FROM sales_bills
-            WHERE bill_month=? AND bill_year=?
-        """, (month, year))
+            FROM sales_bills sb
+            {where_s}
+        """, tuple(params_s))
 
-        # ---- Calculations ----
-        purchase_total  = p.get("grand_total", 0)
-        purchase_taxable= p.get("total_taxable", 0)
-        purchase_gst    = p.get("total_gst", 0)
+        # ---- Active Stock on Hand (Carried Forward Unsold Inventory) ----
+        stock_params = []
+        stock_cond = ["pi.remaining_qty > 0.0001"]
+        if e_date:
+            stock_cond.append("pb.bill_date <= ?")
+            stock_params.append(format_date_iso(e_date))
 
-        sales_total     = s.get("grand_total", 0)
-        sales_taxable   = s.get("total_taxable", 0)
-        output_cgst     = s.get("total_cgst", 0)
-        output_sgst     = s.get("total_sgst", 0)
-        output_gst      = output_cgst + output_sgst
-
-        profit          = sales_taxable - purchase_taxable
-        gst_payable     = max(0, output_gst - purchase_gst)
-
-        p_count = p.get("bill_count", 0)
-        s_count = s.get("bill_count", 0)
-
-        # ---- Tally check ----
-        # Check if all purchased items are distributed in sales
-        items_check = db.query_one("""
+        stock = db.query_one(f"""
             SELECT
-                COALESCE(SUM(remaining_qty), 0) AS total_remaining
+                COALESCE(SUM(pi.remaining_qty * pi.purchase_rate), 0) AS stock_val,
+                COALESCE(SUM(pi.remaining_qty), 0) AS stock_units
             FROM purchase_items pi
             JOIN purchase_bills pb ON pi.purchase_bill_id = pb.id
-            WHERE pb.bill_month=? AND pb.bill_year=?
-        """, (month, year))
-        remaining = items_check.get("total_remaining", 0)
+            WHERE {' AND '.join(stock_cond)}
+        """, tuple(stock_params))
 
-        if p_count == 0:
-            tally_text = "No purchase data"
-            tally_sub  = "Add purchase bills first"
-            tally_color = "#9e9e9e"
-        elif remaining == 0 and s_count > 0:
-            tally_text  = "✅ Tallied"
-            tally_sub   = "All stock accounted for"
-            tally_color = COLORS["tally_ok"]
-        elif s_count == 0:
-            tally_text  = "⚠️ Pending"
-            tally_sub   = "Sales bills not generated"
-            tally_color = COLORS["tally_warn"]
+        # ---- Cost of Goods Sold (COGS) for Period Sales ----
+        cogs_data = db.query_one(f"""
+            SELECT
+                COALESCE(SUM(si.quantity * pi.purchase_rate), 0) AS cogs,
+                COALESCE(SUM(si.quantity * si.selling_rate), 0) AS sales_taxable
+            FROM sales_items si
+            JOIN sales_bills sb ON si.sales_bill_id = sb.id
+            LEFT JOIN purchase_items pi ON si.purchase_item_id = pi.id
+            {where_s}
+        """, tuple(params_s))
+
+        purchase_total   = p.get("grand_total", 0)
+        purchase_taxable = p.get("total_taxable", 0)
+        purchase_gst     = p.get("total_gst", 0)
+
+        sales_total      = s.get("grand_total", 0)
+        sales_taxable    = s.get("total_taxable", 0)
+        output_cgst      = s.get("total_cgst", 0)
+        output_sgst      = s.get("total_sgst", 0)
+        output_gst       = output_cgst + output_sgst
+        p_count = p.get("bill_count", 0)
+        s_count = s.get("bill_count", 0)
+        active_val = stock.get("stock_val", 0)
+        active_units = stock.get("stock_units", 0)
+
+        cogs = cogs_data.get("cogs", 0)
+        if s_count == 0 or sales_taxable <= 0:
+            profit = 0.0
+            profit_sub = "No sales in period"
+        elif cogs > 0:
+            profit = sales_taxable - cogs
+            margin_pct = (profit / cogs * 100) if cogs > 0 else 0
+            profit_sub = f"{margin_pct:.1f}% margin on sold goods"
         else:
-            tally_text  = f"⚠️ {remaining:.1f} units left"
-            tally_sub   = "Some stock not billed yet"
-            tally_color = COLORS["tally_warn"]
+            profit = sales_taxable - purchase_taxable
+            profit_sub = "On taxable value"
 
-        # ---- Update card labels ----
+        gst_payable = max(0.0, output_gst - purchase_gst)
+
+        # Check negative stock
+        neg_item = db.query_one("SELECT COUNT(*) AS cnt FROM purchase_items WHERE remaining_qty < -0.001")
+        has_negative = (neg_item.get("cnt", 0) > 0)
+
+        if has_negative:
+            tally_text = "❌ Stock Error"
+            tally_sub = "Negative stock detected"
+            tally_color = COLORS["tally_bad"]
+        elif p_count == 0 and s_count == 0:
+            tally_text = "No period data"
+            tally_sub = "No transactions in range"
+            tally_color = "#9e9e9e"
+        elif active_units <= 0.001 and s_count > 0:
+            tally_text = "✅ 100% Sold"
+            tally_sub = "All stock accounted for"
+            tally_color = COLORS["tally_ok"]
+        else:
+            tally_text = "✅ Reconciled"
+            tally_sub = f"{active_units:.1f} units in stock"
+            tally_color = COLORS["tally_ok"]
+
         updates = {
             "purchase_total": (
                 f"₹{purchase_total:,.2f}",
-                f"{p_count} bills  |  "
-                f"GST: ₹{purchase_gst:,.2f}"
+                f"{p_count} bills  |  GST: ₹{purchase_gst:,.2f}"
             ),
             "sales_total": (
                 f"₹{sales_total:,.2f}",
-                f"{s_count} bills  |  "
-                f"GST out: ₹{output_gst:,.2f}"
+                f"{s_count} bills  |  GST: ₹{output_gst:,.2f}"
+            ),
+            "stock_total": (
+                f"₹{active_val:,.2f}",
+                f"{active_units:.1f} units carried forward"
             ),
             "profit_total": (
                 f"₹{profit:,.2f}",
-                f"On taxable value"
-                if profit >= 0
-                else "Check purchase entries"
+                profit_sub
             ),
             "gst_payable": (
                 f"₹{gst_payable:,.2f}",
-                f"Output GST - Input GST"
-            ),
-            "bills_count": (
-                f"P:{p_count}  S:{s_count}",
-                f"Purchase | Sales bills"
+                "Output GST - Input GST"
             ),
             "tally_status": (
                 tally_text,
@@ -742,7 +823,6 @@ class DashboardFrame(tk.Frame):
         # Color tally card based on status
         if "tally_status" in self.stat_labels:
             val_lbl, sub_lbl = self.stat_labels["tally_status"]
-            # Find parent card frame and recolor
             parent_frame = val_lbl.master
             parent_frame.configure(bg=tally_color)
             for child in parent_frame.winfo_children():
@@ -760,14 +840,22 @@ class DashboardFrame(tk.Frame):
     # ----------------------------------------------------------
     # RECENT BILLS TABLE DATA
     # ----------------------------------------------------------
-    def _load_recent_bills(self, month: int, year: int):
-        """Fetch last 10 sales bills and display in table"""
-
-        # Clear existing rows
+    def _load_recent_bills(self, s_date=None, e_date=None):
+        """Fetch last 10 sales bills in the date range and display in table"""
         for widget in self.bills_table_frame.winfo_children():
             widget.destroy()
 
-        bills = db.query("""
+        conds = []
+        params = []
+        if s_date:
+            conds.append("sb.bill_date >= ?")
+            params.append(format_date_iso(s_date))
+        if e_date:
+            conds.append("sb.bill_date <= ?")
+            params.append(format_date_iso(e_date))
+        where = f"WHERE {' AND '.join(conds)}" if conds else ""
+
+        bills = db.query(f"""
             SELECT
                 sb.bill_number,
                 sb.customer_name,
@@ -776,15 +864,16 @@ class DashboardFrame(tk.Frame):
                 sb.bill_type,
                 sb.is_printed
             FROM sales_bills sb
-            WHERE sb.bill_month=? AND sb.bill_year=?
+            {where}
             ORDER BY sb.bill_date DESC, sb.id DESC
             LIMIT 10
-        """, (month, year))
+        """, tuple(params))
 
         if not bills:
+            range_desc = f"from {format_date_display(s_date)} to {format_date_display(e_date)}" if s_date and e_date else "for this period"
             tk.Label(
                 self.bills_table_frame,
-                text="No sales bills found for this month.\n"
+                text=f"No sales bills found {range_desc}.\n"
                      "Go to 📤 Sales Bills to generate bills.",
                 font=FONTS["body"],
                 bg=COLORS["bg_card"],
@@ -873,11 +962,22 @@ class DashboardFrame(tk.Frame):
             ).pack(side="left")
 
         # "Show more" if there are more than 10
-        total_count = db.query_one("""
+        total_count = db.query_one(f"""
             SELECT COUNT(*) AS cnt
-            FROM sales_bills
-            WHERE bill_month=? AND bill_year=?
-        """, (month, year))
+            FROM sales_bills sb
+            {where}
+        """, tuple(params))
+
+        total = total_count.get("cnt", 0)
+        if total > 10:
+            tk.Label(
+                self.bills_table_frame,
+                text=f"Showing 10 of {total} bills. "
+                     f"Go to Sales Bills for full list.",
+                font=FONTS["small"],
+                bg=COLORS["bg_card"],
+                fg=COLORS["text_muted"]
+            ).pack(pady=8)
 
         total = total_count.get("cnt", 0)
         if total > 10:

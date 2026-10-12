@@ -25,6 +25,15 @@ from pathlib import Path
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from collections import defaultdict
+from modules.date_utils import (
+    DATE_PRESETS,
+    get_date_range_for_preset,
+    parse_flexible_date,
+    format_date_display,
+    format_date_iso,
+    get_month_dates,
+    get_financial_year,
+)
 
 # ============================================================
 # PATHS
@@ -192,43 +201,75 @@ class TallyEngine:
        → Cannot sell more than purchased
     """
 
+    @staticmethod
+    def _get_conditions(prefix, start_date, end_date, month, year):
+        conds = []
+        params = []
+        if start_date:
+            conds.append(f"{prefix}.bill_date >= ?")
+            params.append(format_date_iso(start_date))
+        if end_date:
+            conds.append(f"{prefix}.bill_date <= ?")
+            params.append(format_date_iso(end_date))
+        if not start_date and not end_date and month and year:
+            conds.append(f"{prefix}.bill_month = ? AND {prefix}.bill_year = ?")
+            params.extend([month, year])
+        where = f"WHERE {' AND '.join(conds)}" if conds else ""
+        return where, params
+
     def run_full_tally(
         self,
-        month: int,
-        year: int
+        month: int = None,
+        year: int = None,
+        start_date = None,
+        end_date = None,
     ) -> dict:
         """
-        Run complete tally check for a month.
+        Run complete tally check for a date range or month.
         Returns comprehensive tally report.
         """
+        if isinstance(start_date, str) and start_date.strip():
+            start_date = parse_flexible_date(start_date)
+        if isinstance(end_date, str) and end_date.strip():
+            end_date = parse_flexible_date(end_date)
+
+        if not start_date and not end_date and month and year:
+            start_date, end_date = get_month_dates(year, month)
+
+        disp_month = start_date.month if start_date else (month or date.today().month)
+        disp_year  = start_date.year if start_date else (year or date.today().year)
+        month_name = MONTH_NAMES[disp_month] if disp_month <= 12 else ""
+
         results = {
-            "month":        month,
-            "year":         year,
-            "month_name":   MONTH_NAMES[month],
-            "checks":       {},
+            "month":          disp_month,
+            "year":           disp_year,
+            "start_date":     start_date,
+            "end_date":       end_date,
+            "month_name":     month_name,
+            "checks":         {},
             "overall_status": "ok",
-            "issues":       [],
-            "summary":      {},
+            "issues":         [],
+            "summary":        {},
         }
 
         # Run all checks
         results["checks"]["quantity"] = \
-            self._check_quantity_tally(month, year)
+            self._check_quantity_tally(disp_month, disp_year, start_date, end_date)
 
         results["checks"]["amount"] = \
-            self._check_amount_tally(month, year)
+            self._check_amount_tally(disp_month, disp_year, start_date, end_date)
 
         results["checks"]["gst"] = \
-            self._check_gst_tally(month, year)
+            self._check_gst_tally(disp_month, disp_year, start_date, end_date)
 
         results["checks"]["sequence"] = \
-            self._check_bill_sequence(month, year)
+            self._check_bill_sequence(disp_month, disp_year, start_date, end_date)
 
         results["checks"]["negative_stock"] = \
-            self._check_negative_stock(month, year)
+            self._check_negative_stock(disp_month, disp_year, start_date, end_date)
 
         results["checks"]["dates"] = \
-            self._check_date_consistency(month, year)
+            self._check_date_consistency(disp_month, disp_year, start_date, end_date)
 
         # Determine overall status
         all_ok  = all(
@@ -248,20 +289,17 @@ class TallyEngine:
             results["overall_status"] = "warning"
 
         # Collect all issues
-        for check_name, check in \
-                results["checks"].items():
+        for check_name, check in results["checks"].items():
             for issue in check.get("issues", []):
                 results["issues"].append({
                     "check":   check_name,
                     "message": issue,
-                    "level":   check.get(
-                        "status", "ok"
-                    ),
+                    "level":   check.get("status", "ok"),
                 })
 
         # Build summary
         results["summary"] = \
-            self._build_summary(month, year)
+            self._build_summary(disp_month, disp_year, start_date, end_date)
 
         return results
 
@@ -271,11 +309,13 @@ class TallyEngine:
     def _check_quantity_tally(
         self,
         month: int,
-        year: int
+        year: int,
+        start_date = None,
+        end_date = None,
     ) -> dict:
         """
-        Check every item: sold qty = purchased qty.
-        remaining_qty should be 0 for all items.
+        Check every item: sold qty + remaining qty = purchased qty.
+        Continuous inventory: unsold stock carried forward is recognized as active inventory.
         """
         result = {
             "name":    "Quantity Tally",
@@ -284,8 +324,11 @@ class TallyEngine:
             "details": [],
         }
 
-        # Get all purchase items with remaining qty
-        items = db.query("""
+        where_p, params_p = self._get_conditions("pb", start_date, end_date, month, year)
+        where_s, params_s = self._get_conditions("sb", start_date, end_date, month, year)
+
+        # Get all purchase items in period
+        items = db.query(f"""
             SELECT
                 pi.item_name,
                 pi.unit,
@@ -295,21 +338,20 @@ class TallyEngine:
             FROM purchase_items pi
             JOIN purchase_bills pb
                 ON pi.purchase_bill_id = pb.id
-            WHERE pb.bill_month = ?
-            AND   pb.bill_year  = ?
+            {where_p}
             GROUP BY pi.item_name, pi.unit
             ORDER BY pi.item_name
-        """, (month, year))
+        """, tuple(params_p))
 
         if not items:
             result["status"]  = "warning"
             result["issues"].append(
-                "No purchase items found for this month."
+                "No purchase items found for this period."
             )
             return result
 
         # Get sold quantities from sales
-        sold_items = db.query("""
+        sold_items = db.query(f"""
             SELECT
                 si.item_name,
                 si.unit,
@@ -317,10 +359,9 @@ class TallyEngine:
             FROM sales_items si
             JOIN sales_bills sb
                 ON si.sales_bill_id = sb.id
-            WHERE sb.bill_month = ?
-            AND   sb.bill_year  = ?
+            {where_s}
             GROUP BY si.item_name, si.unit
-        """, (month, year))
+        """, tuple(params_s))
 
         sold_map = {
             (r["item_name"].lower(), r["unit"]): r
@@ -342,25 +383,15 @@ class TallyEngine:
                 purchased - remaining, 4
             )
 
-            # Cross-check with sales_items table
-            sold_in_sales = sold_map.get(key, {})
-            sales_qty = sold_in_sales.get(
-                "sold_qty", 0
-            ) or 0
-
             diff = round(remaining, 4)
 
             if abs(diff) < 0.001:
                 status = "ok"
                 ok_count += 1
             elif diff > 0:
-                status = "warning"  # unsold stock
-                warn_count += 1
-                result["issues"].append(
-                    f"⚠️  {item['item_name']}: "
-                    f"{diff:.2f} {item['unit']} "
-                    f"not yet sold."
-                )
+                # Active carried-forward inventory
+                status = "ok"
+                ok_count += 1
             else:
                 status = "error"  # oversold!
                 err_count += 1
@@ -380,11 +411,8 @@ class TallyEngine:
                 "status":    status,
             })
 
-        # Overall status
         if err_count > 0:
             result["status"] = "error"
-        elif warn_count > 0:
-            result["status"] = "warning"
         else:
             result["status"] = "ok"
 
@@ -401,12 +429,13 @@ class TallyEngine:
     def _check_amount_tally(
         self,
         month: int,
-        year: int
+        year: int,
+        start_date = None,
+        end_date = None,
     ) -> dict:
         """
-        Check: Sales taxable > Purchase taxable
-        (Sales must always be MORE than purchase
-         due to profit margin)
+        Check: Sales taxable > Cost of goods sold.
+        Gross profit on sold goods must be non-negative.
         """
         result = {
             "name":    "Amount Tally",
@@ -415,32 +444,52 @@ class TallyEngine:
             "details": [],
         }
 
-        p = db.query_one("""
+        where_p, params_p = self._get_conditions("pb", start_date, end_date, month, year)
+        where_s, params_s = self._get_conditions("sb", start_date, end_date, month, year)
+
+        p = db.query_one(f"""
             SELECT
                 COALESCE(SUM(subtotal),    0) AS taxable,
                 COALESCE(SUM(total_gst),   0) AS gst,
                 COALESCE(SUM(grand_total), 0) AS total,
-                COUNT(*)                       AS bills
-            FROM purchase_bills
-            WHERE bill_month = ? AND bill_year = ?
-        """, (month, year))
+                COUNT(*)                      AS bills
+            FROM purchase_bills pb
+            {where_p}
+        """, tuple(params_p))
 
-        s = db.query_one("""
+        s = db.query_one(f"""
             SELECT
                 COALESCE(SUM(subtotal),    0) AS taxable,
                 COALESCE(SUM(total_cgst),  0) AS cgst,
                 COALESCE(SUM(total_sgst),  0) AS sgst,
                 COALESCE(SUM(grand_total), 0) AS total,
-                COUNT(*)                       AS bills
-            FROM sales_bills
-            WHERE bill_month = ? AND bill_year = ?
-        """, (month, year))
+                COUNT(*)                      AS bills
+            FROM sales_bills sb
+            {where_s}
+        """, tuple(params_s))
+
+        # COGS of sold goods
+        cogs_row = db.query_one(f"""
+            SELECT
+                COALESCE(SUM(si.quantity * pi.purchase_rate), 0) AS cogs
+            FROM sales_items si
+            JOIN sales_bills sb ON si.sales_bill_id = sb.id
+            LEFT JOIN purchase_items pi ON si.purchase_item_id = pi.id
+            {where_s}
+        """, tuple(params_s))
+        cogs = cogs_row.get("cogs", 0)
 
         p_taxable = p.get("taxable", 0) or 0
         s_taxable = s.get("taxable", 0) or 0
         p_total   = p.get("total",   0) or 0
         s_total   = s.get("total",   0) or 0
-        profit    = round2(s_taxable - p_taxable)
+
+        if cogs > 0:
+            profit = round2(s_taxable - cogs)
+            margin_pct = round2(profit / cogs * 100) if cogs > 0 else 0
+        else:
+            profit = round2(s_taxable - p_taxable)
+            margin_pct = round2(profit / p_taxable * 100) if p_taxable > 0 else 0
 
         result["details"] = {
             "purchase_taxable": p_taxable,
@@ -452,48 +501,25 @@ class TallyEngine:
             "sales_sgst":       s.get("sgst", 0) or 0,
             "sales_total":      s_total,
             "sales_bills":      s.get("bills", 0),
+            "cogs":             cogs,
             "profit":           profit,
-            "margin_pct": round2(
-                profit / p_taxable * 100
-            ) if p_taxable > 0 else 0,
+            "margin_pct":       margin_pct,
         }
 
-        # Checks
-        if p_taxable == 0:
+        if p_taxable == 0 and s_taxable == 0:
             result["status"] = "warning"
-            result["issues"].append(
-                "No purchase data found."
-            )
+            result["issues"].append("No purchase or sales data found in this period.")
         elif s_taxable == 0:
             result["status"] = "warning"
-            result["issues"].append(
-                "No sales data found. "
-                "Generate sales bills first."
-            )
+            result["issues"].append("No sales data found. Generate sales bills first.")
         elif profit < 0:
             result["status"] = "error"
             result["issues"].append(
-                f"❌ Sales ({format_inr(s_taxable)}) "
-                f"is LESS than purchase "
-                f"({format_inr(p_taxable)}). "
-                f"Loss of {format_inr(abs(profit))}!"
-            )
-        elif profit == 0:
-            result["status"] = "warning"
-            result["issues"].append(
-                "⚠️  Sales equals purchase — "
-                "zero profit margin."
+                f"❌ Sales ({format_inr(s_taxable)}) is LESS than cost of goods sold "
+                f"({format_inr(cogs)}). Loss of {format_inr(abs(profit))}!"
             )
         else:
-            margin = result["details"]["margin_pct"]
-            if margin < 5:
-                result["status"] = "warning"
-                result["issues"].append(
-                    f"⚠️  Profit margin very low: "
-                    f"{margin:.1f}%"
-                )
-            else:
-                result["status"] = "ok"
+            result["status"] = "ok"
 
         return result
 
@@ -503,13 +529,10 @@ class TallyEngine:
     def _check_gst_tally(
         self,
         month: int,
-        year: int
+        year: int,
+        start_date = None,
+        end_date = None,
     ) -> dict:
-        """
-        Check GST by rate:
-        Output GST (sales) vs Input GST (purchases)
-        Net GST payable should be >= 0
-        """
         result = {
             "name":    "GST Tally",
             "status":  "ok",
@@ -517,8 +540,10 @@ class TallyEngine:
             "details": [],
         }
 
-        # Output GST by rate
-        output_gst = db.query("""
+        where_s, params_s = self._get_conditions("sb", start_date, end_date, month, year)
+        where_p, params_p = self._get_conditions("pb", start_date, end_date, month, year)
+
+        output_gst = db.query(f"""
             SELECT
                 si.gst_rate,
                 SUM(si.taxable_amount) AS taxable,
@@ -527,33 +552,25 @@ class TallyEngine:
             FROM sales_items si
             JOIN sales_bills sb
                 ON si.sales_bill_id = sb.id
-            WHERE sb.bill_month = ?
-            AND   sb.bill_year  = ?
+            {where_s}
             GROUP BY si.gst_rate
             ORDER BY si.gst_rate
-        """, (month, year))
+        """, tuple(params_s))
 
-        # Input GST by rate
-        input_gst = db.query("""
+        input_gst = db.query(f"""
             SELECT
                 pi.gst_rate,
-                SUM(pi.quantity *
-                    pi.purchase_rate) AS taxable,
-                SUM(pi.gst_amount)   AS gst
+                SUM(pi.quantity * pi.purchase_rate) AS taxable,
+                SUM(pi.gst_amount)                  AS gst
             FROM purchase_items pi
             JOIN purchase_bills pb
                 ON pi.purchase_bill_id = pb.id
-            WHERE pb.bill_month = ?
-            AND   pb.bill_year  = ?
+            {where_p}
             GROUP BY pi.gst_rate
             ORDER BY pi.gst_rate
-        """, (month, year))
+        """, tuple(params_p))
 
-        input_map = {
-            r["gst_rate"]: r
-            for r in input_gst
-        }
-
+        input_map = {r["gst_rate"]: r for r in input_gst}
         total_output = 0
         total_input  = 0
         issues_found = False
@@ -566,22 +583,18 @@ class TallyEngine:
 
             inp        = input_map.get(rate, {})
             in_gst     = inp.get("gst", 0) or 0
-            net_payable = round2(
-                max(0, out_total - in_gst)
-            )
+            net_payable = round2(max(0, out_total - in_gst))
 
             total_output += out_total
             total_input  += in_gst
 
             gst_rate_ok = out_total >= in_gst
-
             if not gst_rate_ok:
                 issues_found = True
                 result["issues"].append(
                     f"⚠️  GST {rate:.0f}%: "
                     f"Output ({format_inr(out_total)}) "
-                    f"< Input ({format_inr(in_gst)}). "
-                    f"Check if this is intentional."
+                    f"< Input ({format_inr(in_gst)})."
                 )
 
             result["details"].append({
@@ -592,23 +605,17 @@ class TallyEngine:
                 "out_total":  out_total,
                 "in_gst":     in_gst,
                 "net_payable": net_payable,
-                "status": "ok" if gst_rate_ok
-                          else "warning",
+                "status": "ok" if gst_rate_ok else "warning",
             })
 
-        net_total = round2(
-            max(0, total_output - total_input)
-        )
-
+        net_total = round2(max(0, total_output - total_input))
         result["total_output"] = round2(total_output)
         result["total_input"]  = round2(total_input)
         result["net_payable"]  = net_total
 
         if not output_gst:
             result["status"] = "warning"
-            result["issues"].append(
-                "No sales GST data found."
-            )
+            result["issues"].append("No sales GST data found.")
         elif issues_found:
             result["status"] = "warning"
         else:
@@ -622,12 +629,10 @@ class TallyEngine:
     def _check_bill_sequence(
         self,
         month: int,
-        year: int
+        year: int,
+        start_date = None,
+        end_date = None,
     ) -> dict:
-        """
-        Check bill numbers are sequential.
-        No gaps allowed between bill numbers.
-        """
         result = {
             "name":    "Bill Sequence",
             "status":  "ok",
@@ -635,61 +640,46 @@ class TallyEngine:
             "details": [],
         }
 
-        # Get all sales bills for this month
-        bills = db.query("""
-            SELECT bill_number, bill_date
-            FROM sales_bills
-            WHERE bill_month = ? AND bill_year = ?
-            ORDER BY bill_number
-        """, (month, year))
+        where_s, params_s = self._get_conditions("sb", start_date, end_date, month, year)
+        bills = db.query(f"""
+            SELECT sb.bill_number, sb.bill_date
+            FROM sales_bills sb
+            {where_s}
+            ORDER BY sb.bill_number
+        """, tuple(params_s))
 
         if not bills:
             result["status"] = "warning"
-            result["issues"].append(
-                "No sales bills found for this month."
-            )
+            result["issues"].append("No sales bills found for this period.")
             return result
 
-        # Extract numeric parts
         bill_numbers = []
         for bill in bills:
             num_str = bill["bill_number"]
-            # Extract trailing number: INV-2026-0001 → 1
             parts = num_str.split("-")
             try:
                 num = int(parts[-1])
                 bill_numbers.append(num)
             except (ValueError, IndexError):
-                result["issues"].append(
-                    f"⚠️  Cannot parse bill number: "
-                    f"{num_str}"
-                )
+                result["issues"].append(f"⚠️ Cannot parse bill number: {num_str}")
 
         if not bill_numbers:
             return result
 
         bill_numbers.sort()
-
-        # Check for gaps
         gaps = []
-        for i in range(
-            len(bill_numbers) - 1
-        ):
+        for i in range(len(bill_numbers) - 1):
             expected = bill_numbers[i] + 1
             actual   = bill_numbers[i + 1]
             if actual != expected:
-                for missing in range(
-                    expected, actual
-                ):
+                for missing in range(expected, actual):
                     gaps.append(missing)
 
         if gaps:
             result["status"] = "warning"
             gap_strs = [str(g) for g in gaps[:5]]
             result["issues"].append(
-                f"⚠️  Missing bill numbers: "
-                f"{', '.join(gap_strs)}"
-                f"{'...' if len(gaps) > 5 else ''}"
+                f"⚠️ Missing bill numbers: {', '.join(gap_strs)}{'...' if len(gaps) > 5 else ''}"
             )
         else:
             result["status"] = "ok"
@@ -700,7 +690,6 @@ class TallyEngine:
             "total_bills": len(bills),
             "gaps_found":  len(gaps),
         }
-
         return result
 
     # ----------------------------------------------------------
@@ -709,12 +698,10 @@ class TallyEngine:
     def _check_negative_stock(
         self,
         month: int,
-        year: int
+        year: int,
+        start_date = None,
+        end_date = None,
     ) -> dict:
-        """
-        Check no item has negative remaining quantity.
-        This would mean more was sold than purchased.
-        """
         result = {
             "name":    "Negative Stock Check",
             "status":  "ok",
@@ -722,7 +709,8 @@ class TallyEngine:
             "details": [],
         }
 
-        negative_items = db.query("""
+        where_p, params_p = self._get_conditions("pb", start_date, end_date, month, year)
+        negative_items = db.query(f"""
             SELECT
                 pi.item_name,
                 pi.unit,
@@ -730,21 +718,17 @@ class TallyEngine:
             FROM purchase_items pi
             JOIN purchase_bills pb
                 ON pi.purchase_bill_id = pb.id
-            WHERE pb.bill_month = ?
-            AND   pb.bill_year  = ?
+            {where_p}
             GROUP BY pi.item_name, pi.unit
             HAVING SUM(pi.remaining_qty) < -0.001
-        """, (month, year))
+        """, tuple(params_p))
 
         if negative_items:
             result["status"] = "error"
             for item in negative_items:
                 result["issues"].append(
-                    f"❌ NEGATIVE STOCK: "
-                    f"{item['item_name']} — "
-                    f"Oversold by "
-                    f"{abs(item['remaining']):.2f} "
-                    f"{item['unit']}"
+                    f"❌ NEGATIVE STOCK: {item['item_name']} — "
+                    f"Oversold by {abs(item['remaining']):.2f} {item['unit']}"
                 )
                 result["details"].append(item)
         else:
@@ -758,102 +742,60 @@ class TallyEngine:
     def _check_date_consistency(
         self,
         month: int,
-        year: int
+        year: int,
+        start_date = None,
+        end_date = None,
     ) -> dict:
-        """
-        Check sales bill dates are within
-        the correct month/year.
-        Also check no future dates.
-        """
         result = {
             "name":    "Date Consistency",
             "status":  "ok",
             "issues":  [],
             "details": [],
         }
-
         today = date.today()
-
-        # Check for wrong month/year dates
-        wrong_month = db.query("""
-            SELECT bill_number, bill_date
-            FROM sales_bills
-            WHERE bill_month = ?
-            AND   bill_year  = ?
-            AND   (
-                CAST(strftime('%m', bill_date)
-                     AS INTEGER) != ?
-                OR
-                CAST(strftime('%Y', bill_date)
-                     AS INTEGER) != ?
-            )
-        """, (month, year, month, year))
-
-        if wrong_month:
-            result["status"] = "warning"
-            for bill in wrong_month[:3]:
-                result["issues"].append(
-                    f"⚠️  Bill {bill['bill_number']}: "
-                    f"Date {bill['bill_date']} "
-                    f"doesn't match "
-                    f"{MONTH_NAMES[month]} {year}"
-                )
+        where_s, params_s = self._get_conditions("sb", start_date, end_date, month, year)
 
         # Check for future dates
-        future_bills = db.query("""
-            SELECT bill_number, bill_date
-            FROM sales_bills
-            WHERE bill_month = ?
-            AND   bill_year  = ?
-            AND   bill_date > ?
-        """, (
-            month, year,
-            today.strftime("%Y-%m-%d")
-        ))
+        future_conds = list(params_s)
+        future_clause = f"{where_s} {'AND' if where_s else 'WHERE'} sb.bill_date > ?"
+        future_conds.append(today.strftime("%Y-%m-%d"))
+
+        future_bills = db.query(f"""
+            SELECT sb.bill_number, sb.bill_date
+            FROM sales_bills sb
+            {future_clause}
+        """, tuple(future_conds))
 
         if future_bills:
             result["status"] = "warning"
             for bill in future_bills[:3]:
-                result["issues"].append(
-                    f"⚠️  Bill {bill['bill_number']}: "
-                    f"Future date {bill['bill_date']}"
-                )
+                result["issues"].append(f"⚠️ Bill {bill['bill_number']}: Future date {bill['bill_date']}")
 
-        # Check for Sunday dates
-        all_bills = db.query("""
-            SELECT bill_number, bill_date
-            FROM sales_bills
-            WHERE bill_month = ? AND bill_year = ?
-        """, (month, year))
+        all_bills = db.query(f"""
+            SELECT sb.bill_number, sb.bill_date
+            FROM sales_bills sb
+            {where_s}
+        """, tuple(params_s))
 
         sunday_bills = []
         for bill in all_bills:
             try:
-                d = datetime.strptime(
-                    bill["bill_date"], "%Y-%m-%d"
-                )
-                if d.weekday() == 6:  # Sunday
-                    sunday_bills.append(
-                        bill["bill_number"]
-                    )
+                d = datetime.strptime(bill["bill_date"], "%Y-%m-%d")
+                if d.weekday() == 6:
+                    sunday_bills.append(bill["bill_number"])
             except Exception:
                 pass
 
         if sunday_bills:
             result["issues"].append(
-                f"ℹ️  Bills on Sunday: "
-                f"{', '.join(sunday_bills[:3])}"
-                f"{'...' if len(sunday_bills) > 3 else ''}"
-                f" (verify if shop was open)"
+                f"ℹ️ Bills on Sunday: {', '.join(sunday_bills[:3])}{'...' if len(sunday_bills) > 3 else ''} (verify if shop was open)"
             )
 
         result["details"] = {
-            "wrong_month_count": len(wrong_month),
-            "future_count":      len(future_bills),
-            "sunday_count":      len(sunday_bills),
-            "total_bills":       len(all_bills),
+            "future_count": len(future_bills),
+            "sunday_count": len(sunday_bills),
+            "total_bills":  len(all_bills),
         }
-
         return result
 
     # ----------------------------------------------------------
@@ -862,32 +804,45 @@ class TallyEngine:
     def _build_summary(
         self,
         month: int,
-        year: int
+        year: int,
+        start_date = None,
+        end_date = None,
     ) -> dict:
-        """Build overall tally summary numbers"""
+        where_p, params_p = self._get_conditions("pb", start_date, end_date, month, year)
+        where_s, params_s = self._get_conditions("sb", start_date, end_date, month, year)
 
-        p = db.query_one("""
+        p = db.query_one(f"""
             SELECT
-                COUNT(*)                   AS p_bills,
-                COUNT(DISTINCT dealer_name) AS dealers,
+                COUNT(*)                     AS p_bills,
+                COUNT(DISTINCT dealer_name)  AS dealers,
                 COALESCE(SUM(subtotal),    0) AS p_taxable,
                 COALESCE(SUM(total_gst),   0) AS p_gst,
                 COALESCE(SUM(grand_total), 0) AS p_total
-            FROM purchase_bills
-            WHERE bill_month = ? AND bill_year = ?
-        """, (month, year))
+            FROM purchase_bills pb
+            {where_p}
+        """, tuple(params_p))
 
-        s = db.query_one("""
+        s = db.query_one(f"""
             SELECT
-                COUNT(*)                     AS s_bills,
-                COUNT(DISTINCT customer_name) AS customers,
+                COUNT(*)                       AS s_bills,
+                COUNT(DISTINCT customer_name)  AS customers,
                 COALESCE(SUM(subtotal),      0) AS s_taxable,
                 COALESCE(SUM(total_cgst),    0) AS s_cgst,
                 COALESCE(SUM(total_sgst),    0) AS s_sgst,
                 COALESCE(SUM(grand_total),   0) AS s_total
-            FROM sales_bills
-            WHERE bill_month = ? AND bill_year = ?
-        """, (month, year))
+            FROM sales_bills sb
+            {where_s}
+        """, tuple(params_s))
+
+        cogs_row = db.query_one(f"""
+            SELECT
+                COALESCE(SUM(si.quantity * pi.purchase_rate), 0) AS cogs
+            FROM sales_items si
+            JOIN sales_bills sb ON si.sales_bill_id = sb.id
+            LEFT JOIN purchase_items pi ON si.purchase_item_id = pi.id
+            {where_s}
+        """, tuple(params_s))
+        cogs = cogs_row.get("cogs", 0)
 
         p_taxable = p.get("p_taxable", 0) or 0
         s_taxable = s.get("s_taxable", 0) or 0
@@ -896,51 +851,45 @@ class TallyEngine:
         s_sgst    = s.get("s_sgst", 0) or 0
         s_gst     = s_cgst + s_sgst
 
-        profit     = round2(s_taxable - p_taxable)
-        gst_payable = round2(max(0, s_gst - p_gst))
-        margin_pct  = round2(
-            profit / p_taxable * 100
-        ) if p_taxable > 0 else 0
+        if cogs > 0:
+            profit = round2(s_taxable - cogs)
+            margin_pct = round2(profit / cogs * 100) if cogs > 0 else 0
+        else:
+            profit = round2(s_taxable - p_taxable)
+            margin_pct = round2(profit / p_taxable * 100) if p_taxable > 0 else 0
 
-        # Remaining stock
-        remaining = db.query_one("""
+        gst_payable = round2(max(0, s_gst - p_gst))
+
+        remaining = db.query_one(f"""
             SELECT
-                COALESCE(SUM(pi.remaining_qty), 0)
-                    AS total_remaining,
-                COUNT(DISTINCT pi.item_name)
-                    AS items_with_remaining
+                COALESCE(SUM(pi.remaining_qty), 0) AS total_remaining,
+                COUNT(DISTINCT pi.item_name)        AS items_with_remaining
             FROM purchase_items pi
             JOIN purchase_bills pb
                 ON pi.purchase_bill_id = pb.id
-            WHERE pb.bill_month = ?
-            AND   pb.bill_year  = ?
-            AND   pi.remaining_qty > 0.001
-        """, (month, year))
+            {where_p}
+            AND pi.remaining_qty > 0.001
+        """, tuple(params_p))
 
         return {
-            "p_bills":      p.get("p_bills", 0),
-            "dealers":      p.get("dealers", 0),
-            "p_taxable":    p_taxable,
-            "p_gst":        p_gst,
-            "p_total":      p.get("p_total", 0) or 0,
-            "s_bills":      s.get("s_bills", 0),
-            "customers":    s.get("customers", 0),
-            "s_taxable":    s_taxable,
-            "s_cgst":       s_cgst,
-            "s_sgst":       s_sgst,
-            "s_gst":        s_gst,
-            "s_total":      s.get("s_total", 0) or 0,
-            "profit":       profit,
-            "margin_pct":   margin_pct,
-            "gst_payable":  gst_payable,
-            "total_remaining":
-                remaining.get(
-                    "total_remaining", 0
-                ) or 0,
-            "items_pending":
-                remaining.get(
-                    "items_with_remaining", 0
-                ) or 0,
+            "p_bills":         p.get("p_bills", 0),
+            "dealers":         p.get("dealers", 0),
+            "p_taxable":       p_taxable,
+            "p_gst":           p_gst,
+            "p_total":         p.get("p_total", 0) or 0,
+            "s_bills":         s.get("s_bills", 0),
+            "customers":       s.get("customers", 0),
+            "s_taxable":       s_taxable,
+            "s_cgst":          s_cgst,
+            "s_sgst":          s_sgst,
+            "s_gst":           s_gst,
+            "s_total":         s.get("s_total", 0) or 0,
+            "cogs":            cogs,
+            "profit":          profit,
+            "margin_pct":      margin_pct,
+            "gst_payable":     gst_payable,
+            "total_remaining": remaining.get("total_remaining", 0) or 0,
+            "items_pending":   remaining.get("items_with_remaining", 0) or 0,
         }
 
 
@@ -974,6 +923,10 @@ class TallyFrame(tk.Frame):
         self.results = None
 
         today = date.today()
+        self.preset_var = tk.StringVar(value="This Month")
+        s_date, e_date = get_date_range_for_preset("This Month")
+        self.from_date_var = tk.StringVar(value=format_date_display(s_date) if s_date else "")
+        self.to_date_var   = tk.StringVar(value=format_date_display(e_date) if e_date else "")
         self.view_month = tk.IntVar(value=today.month)
         self.view_year  = tk.IntVar(value=today.year)
 
@@ -1003,55 +956,59 @@ class TallyFrame(tk.Frame):
         right = tk.Frame(top, bg=COLORS["bg_main"])
         right.pack(side="right")
 
-        # Month filter
         tk.Label(
             right,
-            text="Month:",
+            text="Period:",
             font=FONTS["label_bold"],
             bg=COLORS["bg_main"],
             fg=COLORS["text_dark"]
-        ).pack(side="left", padx=(0, 5))
+        ).pack(side="left", padx=(0, 4))
 
-        self.month_cb = ttk.Combobox(
+        self.preset_cb = ttk.Combobox(
             right,
-            values=MONTH_NAMES[1:],
+            values=DATE_PRESETS,
+            width=15,
+            font=FONTS["body"],
+            state="readonly"
+        )
+        self.preset_cb.set(self.preset_var.get())
+        self.preset_cb.pack(side="left", padx=3)
+        self.preset_cb.bind(
+            "<<ComboboxSelected>>",
+            self._on_preset_change
+        )
+
+        tk.Label(
+            right,
+            text="From:",
+            font=FONTS["label"],
+            bg=COLORS["bg_main"],
+            fg=COLORS["text_muted"]
+        ).pack(side="left", padx=(6, 2))
+
+        self.from_ent = tk.Entry(
+            right,
+            textvariable=self.from_date_var,
             width=11,
-            font=FONTS["body"],
-            state="readonly"
+            font=FONTS["body"]
         )
-        self.month_cb.set(
-            MONTH_NAMES[self.view_month.get()]
-        )
-        self.month_cb.pack(side="left", padx=3)
-        self.month_cb.bind(
-            "<<ComboboxSelected>>",
-            lambda e: self._on_filter_change(
-                self.month_cb.get(), None
-            )
-        )
+        self.from_ent.pack(side="left", padx=2)
 
-        # Year filter
-        current_year = date.today().year
-        self.year_cb = ttk.Combobox(
+        tk.Label(
             right,
-            values=[
-                str(y) for y in range(
-                    current_year - 3,
-                    current_year + 2
-                )
-            ],
-            width=7,
-            font=FONTS["body"],
-            state="readonly"
+            text="To:",
+            font=FONTS["label"],
+            bg=COLORS["bg_main"],
+            fg=COLORS["text_muted"]
+        ).pack(side="left", padx=(4, 2))
+
+        self.to_ent = tk.Entry(
+            right,
+            textvariable=self.to_date_var,
+            width=11,
+            font=FONTS["body"]
         )
-        self.year_cb.set(str(self.view_year.get()))
-        self.year_cb.pack(side="left", padx=3)
-        self.year_cb.bind(
-            "<<ComboboxSelected>>",
-            lambda e: self._on_filter_change(
-                None, self.year_cb.get()
-            )
-        )
+        self.to_ent.pack(side="left", padx=2)
 
         # Action buttons
         for label, color, cmd in [
@@ -1072,10 +1029,33 @@ class TallyFrame(tk.Frame):
                 bg=color,
                 fg="white",
                 relief="flat",
-                padx=12, pady=6,
+                padx=11, pady=6,
                 cursor="hand2",
                 command=cmd
             ).pack(side="left", padx=3)
+
+    def _on_preset_change(self, event=None):
+        preset = self.preset_cb.get()
+        self.preset_var.set(preset)
+        s, e = get_date_range_for_preset(preset)
+        if s:
+            self.from_date_var.set(format_date_display(s))
+            self.view_month.set(s.month)
+            self.view_year.set(s.year)
+        else:
+            self.from_date_var.set("")
+        if e:
+            self.to_date_var.set(format_date_display(e))
+        else:
+            self.to_date_var.set("")
+        self._run_tally()
+
+    def _get_active_date_range(self):
+        s_raw = self.from_date_var.get().strip()
+        e_raw = self.to_date_var.get().strip()
+        s_date = parse_flexible_date(s_raw) if s_raw else None
+        e_date = parse_flexible_date(e_raw) if e_raw else None
+        return s_date, e_date
 
     def _on_filter_change(self, month_name, year_str):
         if month_name:
@@ -1144,17 +1124,21 @@ class TallyFrame(tk.Frame):
     # ----------------------------------------------------------
     def _run_tally(self):
         """Run tally engine and render results"""
-        month = self.view_month.get()
-        year  = self.view_year.get()
+        s_date, e_date = self._get_active_date_range()
+        disp_month = s_date.month if s_date else self.view_month.get()
+        disp_year  = s_date.year if s_date else self.view_year.get()
 
+        period_desc = f"{format_date_display(s_date)} to {format_date_display(e_date)}" if s_date and e_date else f"{MONTH_NAMES[disp_month]} {disp_year}"
         self.app.set_status(
-            f"Running tally for "
-            f"{MONTH_NAMES[month]} {year}...",
+            f"Running tally for {period_desc}...",
             "info"
         )
 
         self.results = self.engine.run_full_tally(
-            month, year
+            month=disp_month,
+            year=disp_year,
+            start_date=s_date,
+            end_date=e_date,
         )
 
         self._clear_content()
@@ -1183,27 +1167,32 @@ class TallyFrame(tk.Frame):
     def _render_overall_status(self):
         """Big status banner at the top"""
         status = self.results["overall_status"]
-        month  = self.results["month"]
-        year   = self.results["year"]
+        s_date = self.results.get("start_date")
+        e_date = self.results.get("end_date")
+        if s_date and e_date:
+            period_str = f"{format_date_display(s_date)} to {format_date_display(e_date)}"
+        elif s_date:
+            period_str = f"From {format_date_display(s_date)}"
+        elif e_date:
+            period_str = f"Up to {format_date_display(e_date)}"
+        else:
+            period_str = f"{MONTH_NAMES[self.results['month']]} {self.results['year']}"
 
         config = {
             "ok": (
                 COLORS["success"],
                 "✅  ALL CHECKS PASSED",
-                f"{MONTH_NAMES[month]} {year} — "
-                f"Purchase and Sales perfectly tallied!"
+                f"{period_str} — Continuous inventory reconciled and perfectly tallied!"
             ),
             "warning": (
                 COLORS["warning"],
                 "⚠️  SOME WARNINGS",
-                f"{MONTH_NAMES[month]} {year} — "
-                f"Review warnings below."
+                f"{period_str} — Review warnings below."
             ),
             "error": (
                 COLORS["danger"],
                 "❌  ERRORS FOUND",
-                f"{MONTH_NAMES[month]} {year} — "
-                f"Critical issues detected. Fix immediately!"
+                f"{period_str} — Critical issues detected. Fix immediately!"
             ),
         }
 
